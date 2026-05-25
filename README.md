@@ -30,17 +30,16 @@ Write minimal config with arguments:
 /webdav-sync init url=https://dav.example.com/pi-agent-sync/ username=you passwordEnv=PI_WEBDAV_PASSWORD remoteDir=/
 ```
 
-Config, backups, and internal state live under one hidden directory in your home folder, outside the Pi agent config tree:
+WebDAV config lives next to Pi's global settings file and is excluded from sync:
 
 ```text
-~/.pi-webdav-sync/config.json
-~/.pi-webdav-sync/backups/
+~/.pi/agent/settings.json.webdav
 ```
 
-Set `PI_WEBDAV_SYNC_DIR` if you want a different local state directory.
+Backups and internal state live under hidden local state:
 
 ```text
-PI_WEBDAV_SYNC_DIR=/path/to/state
+~/.pi/agent/.webdav-sync/backups/
 ```
 
 Supported fields include `remoteBaseUrl` (or init alias `url`), `username`, `passwordEnv`, `password` (less safe fallback), `remoteDir`, `installMissingPackages`, and `backupRetention`.
@@ -94,7 +93,7 @@ Pull restores external resources to `~/.pi/agent/external-resources/...` so the 
 Before non-dry-run `pull`, the current local allowlist state is saved to:
 
 ```text
-~/.pi-webdav-sync/backups/<timestamp>/backup.zip
+~/.pi/agent/.webdav-sync/backups/<timestamp>/backup.zip
 ```
 
 Use `/webdav-sync restore latest --yes` to revert to the latest local backup. Backups and plugin config are excluded from sync.

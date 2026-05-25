@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { collectAgentArchive } from "./collector.js";
-import { configDir } from "./config.js";
+import { stateDir } from "./config.js";
 import {
 	ALLOWLIST_DIRS,
 	ALLOWLIST_FILES,
@@ -159,7 +159,7 @@ export async function diffArchiveAgainstLocal(
 }
 
 export function backupsDir(agentDir: string): string {
-	return path.join(configDir(agentDir), "backups");
+	return path.join(stateDir(agentDir), "backups");
 }
 
 async function clearAllowlistedTargets(agentDir: string): Promise<void> {

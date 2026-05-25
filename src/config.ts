@@ -1,6 +1,5 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import os from "node:os";
 import { getAgentDir } from "./paths.js";
 
 export type WebdavSyncConfig = {
@@ -14,12 +13,16 @@ export type WebdavSyncConfig = {
   backupRetention?: number;
 };
 
-export function configDir(_agentDir = getAgentDir()): string {
-  return path.resolve(process.env.PI_WEBDAV_SYNC_DIR || path.join(os.homedir(), ".pi-webdav-sync"));
+export function configDir(agentDir = getAgentDir()): string {
+  return agentDir;
 }
 
 export function configPath(agentDir = getAgentDir()): string {
-  return path.join(configDir(agentDir), "config.json");
+  return path.join(configDir(agentDir), "settings.json.webdav");
+}
+
+export function stateDir(agentDir = getAgentDir()): string {
+  return path.join(agentDir, ".webdav-sync");
 }
 
 export function defaultConfig(): WebdavSyncConfig {

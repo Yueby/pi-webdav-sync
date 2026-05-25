@@ -119,7 +119,7 @@ async function commandInit(
 		next.backupRetention = Number.parseInt(assignments.backupRetention, 10);
 	await writeConfig(next, agentDir);
 	const warnings = next.password
-		? ["warning: password is stored in ~/.pi-webdav-sync/config.json; passwordEnv is safer."]
+		? ["warning: password is stored in settings.json.webdav; passwordEnv is safer."]
 		: [];
 	if (flags.has("--json"))
 		return ok(JSON.stringify({ configPath: path, warnings }, null, 2), {

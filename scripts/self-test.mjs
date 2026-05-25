@@ -48,8 +48,6 @@ class MemoryBackend {
 const tempRoot = await fs.mkdtemp(
 	path.join(os.tmpdir(), "pi-webdav-sync-test-"),
 );
-process.env.PI_WEBDAV_SYNC_DIR = path.join(tempRoot, "sync-state");
-
 const sourceAgent = path.join(tempRoot, "source-agent");
 const targetAgent = path.join(tempRoot, "target-agent");
 const externalDir = path.join(tempRoot, "external package");
@@ -325,7 +323,7 @@ try {
 	);
 
 	const backups = await fs.readdir(
-		path.join(tempRoot, "sync-state", "backups"),
+		path.join(targetAgent, ".webdav-sync", "backups"),
 	);
 	assert.equal(backups.length, 1, "pull should create one local backup");
 	const restoreDryRun = await runWebdavSyncCommand(
