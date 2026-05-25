@@ -60,6 +60,11 @@ export class WebdavBackend implements SyncBackend {
 		return this.client.exists(this.fullPath(remotePath));
 	}
 
+	async copy(fromPath: string, toPath: string): Promise<void> {
+		await this.ensureRemoteDir();
+		await this.client.copyFile(this.fullPath(fromPath), this.fullPath(toPath));
+	}
+
 	async list(remotePath = "."): Promise<RemoteListEntry[]> {
 		const items = await this.client.getDirectoryContents(
 			this.fullPath(remotePath),

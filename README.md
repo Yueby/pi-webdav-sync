@@ -1,6 +1,6 @@
 # pi-webdav-sync
 
-MVP Pi package for syncing selected `~/.pi/agent` files through a generic WebDAV server. It stores only two remote files: `latest.zip` and `latest.json`.
+MVP Pi package for syncing selected `~/.pi/agent` files through a generic WebDAV server. It stores `latest.zip`, `latest.json`, and timestamped snapshots under `snapshots/`.
 
 ## Install for development
 
@@ -18,17 +18,7 @@ pi install npm:pi-webdav-sync
 
 ## Configure
 
-Show config path and an example:
-
-```text
-/webdav-sync init
-```
-
-Write minimal config with arguments:
-
-```text
-/webdav-sync init url=https://dav.example.com/pi-agent-sync/ username=you passwordEnv=PI_WEBDAV_PASSWORD remoteDir=/
-```
+Create this file yourself:
 
 WebDAV config lives next to Pi's global settings file and is excluded from sync:
 
@@ -46,25 +36,31 @@ Supported fields include `remoteBaseUrl` (or init alias `url`), `username`, `pas
 
 ### Jianguoyun / 坚果云 WebDAV example
 
-Create an application password in 坚果云, set it as an environment variable, then run:
+Create an application password in 坚果云, then write:
 
-```text
-/webdav-sync init url=https://dav.jianguoyun.com/dav/ username=your-email@example.com passwordEnv=PI_WEBDAV_PASSWORD remoteDir=/pi-agent-sync
+```json
+{
+  "backend": "webdav",
+  "remoteBaseUrl": "https://dav.jianguoyun.com/dav/",
+  "username": "your-email@example.com",
+  "password": "your-app-password",
+  "remoteDir": "/pi-agent-sync",
+  "installMissingPackages": "ask",
+  "backupRetention": 5
+}
 ```
 
 The backend is generic WebDAV; 坚果云 is only an example.
 
 ## Commands
 
-- `/webdav-sync status [--json]` - collect local manifest. If configured, read remote `latest.json` and compare content hashes.
-- `/webdav-sync push --dry-run [--json]` - build local zip/manifest summary without upload.
-- `/webdav-sync push --yes [--json]` - upload only `latest.zip` and `latest.json`.
-- `/webdav-sync pull --dry-run [--json]` - download and verify remote archive, then show planned add/modify/remove counts.
-- `/webdav-sync pull --yes [--install-missing]` - verify remote archive, create a local backup, restore `files/` and `external-resources/`, and optionally run `pi install <source>` for remote package specs.
-- `/webdav-sync restore latest|<id> --dry-run` - show what a local backup restore would apply.
-- `/webdav-sync restore latest|<id> --yes` - restore from local backup only; it never contacts WebDAV.
+- `/webdav-sync:push --dry-run` - preview local archive.
+- `/webdav-sync:push --yes` - upload `latest.zip`, `latest.json`, and one timestamped snapshot.
+- `/webdav-sync:pull --dry-run` - choose a remote snapshot and preview changes.
+- `/webdav-sync:pull --yes [--install-missing]` - choose a remote snapshot, backup local state, and apply it.
+- `/webdav-sync:pull --yes --snapshot=<id>` - skip TUI selection and pull a specific snapshot.
 
-`push`, `pull`, and `restore` require `--yes` unless using `--dry-run`.
+`push` and `pull` require `--yes` unless using `--dry-run`.
 
 ## What is collected
 
@@ -96,7 +92,7 @@ Before non-dry-run `pull`, the current local allowlist state is saved to:
 ~/.pi/agent/.webdav-sync/backups/<timestamp>/backup.zip
 ```
 
-Use `/webdav-sync restore latest --yes` to revert to the latest local backup. Backups and plugin config are excluded from sync.
+Backups are local safety copies. There is no public restore command; use the latest backup manually if needed.
 
 ## Security boundary
 

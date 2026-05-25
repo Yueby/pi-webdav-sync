@@ -14,6 +14,7 @@ const { createLatestZip, listZipEntries, parseArchive } = await import(
 	distUrl("zip-store.js")
 );
 const { runWebdavSyncCommand } = await import(distUrl("commands.js"));
+const { loadBackup, applyArchiveToAgent } = await import(distUrl("backup.js"));
 
 class MemoryBackend {
 	files = new Map();
@@ -199,78 +200,41 @@ try {
 		"manifest paths outside allowlist should be rejected",
 	);
 
-	const noConfigStatus = await runWebdavSyncCommand(["status", "--json"], {
-		agentDir: sourceAgent,
-	});
-	assert.equal(
-		noConfigStatus.ok,
-		true,
-		"status without config should still succeed",
-	);
-	assert.equal(
-		JSON.parse(noConfigStatus.text).configured,
-		false,
-		"status should report missing config",
-	);
-
-	const init = await runWebdavSyncCommand(
-		[
-			"init",
-			"url=https://example.invalid/dav/",
-			"username=user",
-			"passwordEnv=PI_WEBDAV_TEST_PASSWORD",
-			"remoteDir=/pi",
-		],
-		{ agentDir: sourceAgent },
-	);
-	assert.equal(init.ok, true, "init should write config");
+	await writeTestConfig(sourceAgent);
 	const backend = new MemoryBackend();
 	const push = await runWebdavSyncCommand(["push", "--yes", "--json"], {
 		agentDir: sourceAgent,
 		backend,
 	});
 	assert.equal(push.ok, true, "push --yes should upload to backend");
-	assert.deepEqual(
-		[...backend.files.keys()].sort(),
-		["latest.json", "latest.zip"],
-		"push should upload only latest.json/latest.zip",
-	);
-
-	const remoteStatus = await runWebdavSyncCommand(["status", "--json"], {
-		agentDir: sourceAgent,
-		backend,
-	});
-	assert.equal(remoteStatus.ok, true, "status with remote should succeed");
-	assert.equal(
-		JSON.parse(remoteStatus.text).comparison,
-		"same",
-		"remote and local hashes should match after push",
-	);
+	const remoteKeys = [...backend.files.keys()].sort();
+	assert.equal(remoteKeys[0], "latest.json");
+	assert.equal(remoteKeys[1], "latest.zip");
+	assert.equal(remoteKeys.filter((key) => key.startsWith("snapshots/") && key.endsWith(".json")).length, 1);
+	assert.equal(remoteKeys.filter((key) => key.startsWith("snapshots/") && key.endsWith(".zip")).length, 1);
 
 	await seedTargetAgent(targetAgent);
-	await runWebdavSyncCommand(
-		[
-			"init",
-			"url=https://example.invalid/dav/",
-			"username=user",
-			"passwordEnv=PI_WEBDAV_TEST_PASSWORD",
-		],
-		{ agentDir: targetAgent },
-	);
+	await writeTestConfig(targetAgent);
+	let selectedSnapshot;
 	const dryPull = await runWebdavSyncCommand(["pull", "--dry-run", "--json"], {
 		agentDir: targetAgent,
 		backend,
+		selectSnapshot: async (choices) => {
+			selectedSnapshot = choices[1]?.id;
+			return selectedSnapshot;
+		},
 	});
 	assert.equal(dryPull.ok, true, "pull --dry-run should succeed");
 	assert(
-		JSON.parse(dryPull.text).diff.modify.includes("AGENTS.md"),
+		(dryPull.data.diff.modify || []).includes("AGENTS.md"),
 		"dry-run should report changed AGENTS.md",
 	);
 	assert(
-		JSON.parse(dryPull.text).diff.externalAdd.length > 0,
+		dryPull.data.diff.externalAdd.length > 0,
 		"dry-run should report external resource adds",
 	);
 
+	assert(selectedSnapshot?.startsWith("20"), "pull should expose snapshot choices");
 	const pull = await runWebdavSyncCommand(["pull", "--yes"], {
 		agentDir: targetAgent,
 		backend,
@@ -326,15 +290,8 @@ try {
 		path.join(targetAgent, ".webdav-sync", "backups"),
 	);
 	assert.equal(backups.length, 1, "pull should create one local backup");
-	const restoreDryRun = await runWebdavSyncCommand(
-		["restore", "latest", "--dry-run"],
-		{ agentDir: targetAgent },
-	);
-	assert.equal(restoreDryRun.ok, true, "restore --dry-run should succeed");
-	const restore = await runWebdavSyncCommand(["restore", "latest", "--yes"], {
-		agentDir: targetAgent,
-	});
-	assert.equal(restore.ok, true, "restore latest should apply backup");
+	const { archive } = await loadBackup(targetAgent, "latest");
+	await applyArchiveToAgent(targetAgent, archive);
 	assert.equal(
 		await fs.readFile(path.join(targetAgent, "AGENTS.md"), "utf8"),
 		"old target\n",
@@ -420,6 +377,23 @@ async function seedSourceAgent(agentDir, externalDir) {
 					{ source: externalDir, extensions: ["x"] },
 				],
 				skills: [path.join(externalDir, "src")],
+			},
+			null,
+			2,
+		)}\n`,
+	);
+}
+
+async function writeTestConfig(agentDir) {
+	await fs.writeFile(
+		path.join(agentDir, "settings.webdav.json"),
+		`${JSON.stringify(
+			{
+				backend: "webdav",
+				remoteBaseUrl: "https://example.invalid/dav/",
+				username: "user",
+				passwordEnv: "PI_WEBDAV_TEST_PASSWORD",
+				remoteDir: "/pi",
 			},
 			null,
 			2,

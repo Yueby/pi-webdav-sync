@@ -10,6 +10,7 @@ export interface SyncBackend {
 	getBytes(remotePath: string): Promise<Uint8Array>;
 	putJson(remotePath: string, data: unknown): Promise<void>;
 	putBytes(remotePath: string, bytes: Uint8Array): Promise<void>;
+	copy?(fromPath: string, toPath: string): Promise<void>;
 	exists(remotePath: string): Promise<boolean>;
 	list(remotePath?: string): Promise<RemoteListEntry[]>;
 }

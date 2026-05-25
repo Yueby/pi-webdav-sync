@@ -1,29 +1,17 @@
-import fs from "node:fs/promises";
 import { spawn } from "node:child_process";
 import {
 	createLocalBackup,
 	applyArchiveToAgent,
 	diffArchiveAgainstLocal,
-	loadBackup,
 } from "./backup.js";
 import { collectAgentArchive } from "./collector.js";
-import {
-	configPath,
-	defaultConfig,
-	readConfig,
-	type WebdavSyncConfig,
-	writeConfig,
-} from "./config.js";
+import { configPath, readConfig, type WebdavSyncConfig } from "./config.js";
 import { createLatestIndex, type LatestIndex, shortHash } from "./manifest.js";
 import { getAgentDir } from "./paths.js";
 import { missingInstallSpecs } from "./package-specs.js";
-import {
-	createLatestZip,
-	parseArchive,
-	type ParsedArchive,
-} from "./zip-store.js";
+import { createLatestZip, parseArchive, type ParsedArchive } from "./zip-store.js";
 import { createWebdavBackend } from "./backends/webdav.js";
-import type { SyncBackend } from "./backends/types.js";
+import type { RemoteListEntry, SyncBackend } from "./backends/types.js";
 
 export type CommandResult = {
 	ok: boolean;
@@ -33,8 +21,13 @@ export type CommandResult = {
 
 export type CommandContext = {
 	agentDir?: string;
-	args?: string[];
 	backend?: SyncBackend;
+	selectSnapshot?: (choices: SnapshotChoice[]) => Promise<string | undefined>;
+};
+
+export type SnapshotChoice = {
+	id: string;
+	label: string;
 };
 
 type Flags = Set<string>;
@@ -44,118 +37,23 @@ export async function runWebdavSyncCommand(
 	context: CommandContext = {},
 ): Promise<CommandResult> {
 	const args = Array.isArray(input) ? input : splitArgs(input);
-	const subcommand = args[0] || "help";
-	const rest = args.slice(1);
+	const command = normalizeCommand(args[0] || "help");
 	const flags = new Set(args.filter((arg) => arg.startsWith("--")));
 	const agentDir = getAgentDir(context.agentDir);
 
 	try {
-		if (subcommand === "help" || subcommand === "--help" || subcommand === "-h")
-			return ok(helpText());
-		if (subcommand === "init") return await commandInit(agentDir, rest, flags);
-		if (subcommand === "status")
-			return await commandStatus(agentDir, flags, context.backend);
-		if (subcommand === "push")
-			return await commandPush(agentDir, flags, context.backend);
-		if (subcommand === "pull")
-			return await commandPull(agentDir, flags, context.backend);
-		if (subcommand === "restore")
-			return await commandRestore(agentDir, rest, flags);
-		return fail(
-			`Unknown /webdav-sync subcommand: ${subcommand}\n\n${helpText()}`,
-		);
+		if (command === "push") return await commandPush(agentDir, flags, context.backend);
+		if (command === "pull") return await commandPull(agentDir, flags, context);
+		return ok(helpText());
 	} catch (error) {
 		return fail(error instanceof Error ? error.message : String(error));
 	}
 }
 
-export async function handleWebdavSyncCommand(
-	...args: unknown[]
-): Promise<string> {
+export async function handleWebdavSyncCommand(...args: unknown[]): Promise<string> {
 	const input = extractInput(args);
 	const result = await runWebdavSyncCommand(input);
 	return result.text;
-}
-
-async function commandInit(
-	agentDir: string,
-	args: string[],
-	flags: Flags,
-): Promise<CommandResult> {
-	const assignments = parseAssignments(args);
-	const path = configPath(agentDir);
-	if (!Object.keys(assignments).length) {
-		const sample = {
-			...defaultConfig(),
-			remoteBaseUrl: "https://dav.example.com/pi-agent-sync/",
-			username: "user",
-			passwordEnv: "PI_WEBDAV_PASSWORD",
-		};
-		return ok(
-			[
-				`Config path: ${path}`,
-				"Edit this file or run:",
-				"/webdav-sync init url=https://dav.example.com/pi-agent-sync/ username=user passwordEnv=PI_WEBDAV_PASSWORD remoteDir=/",
-				"",
-				"Example config:",
-				JSON.stringify(sample, null, 2),
-			].join("\n"),
-		);
-	}
-	const current = (await readConfig(agentDir)) || defaultConfig();
-	const next: WebdavSyncConfig = { ...current };
-	if (assignments.url) next.remoteBaseUrl = assignments.url;
-	if (assignments.remoteBaseUrl) next.remoteBaseUrl = assignments.remoteBaseUrl;
-	if (assignments.username) next.username = assignments.username;
-	if (assignments.passwordEnv) next.passwordEnv = assignments.passwordEnv;
-	if (assignments.password) next.password = assignments.password;
-	if (assignments.remoteDir) next.remoteDir = assignments.remoteDir;
-	if (
-		assignments.installMissingPackages &&
-		isInstallPolicy(assignments.installMissingPackages)
-	)
-		next.installMissingPackages = assignments.installMissingPackages;
-	if (assignments.backupRetention)
-		next.backupRetention = Number.parseInt(assignments.backupRetention, 10);
-	await writeConfig(next, agentDir);
-	const warnings = next.password
-		? ["warning: password is stored in settings.json.webdav; passwordEnv is safer."]
-		: [];
-	if (flags.has("--json"))
-		return ok(JSON.stringify({ configPath: path, warnings }, null, 2), {
-			configPath: path,
-			warnings,
-		});
-	return ok([`Wrote WebDAV sync config: ${path}`, ...warnings].join("\n"));
-}
-
-async function commandStatus(
-	agentDir: string,
-	flags: Flags,
-	backendOverride?: SyncBackend,
-): Promise<CommandResult> {
-	const local = await buildLocalSummary(agentDir);
-	const config = await readConfig(agentDir);
-	const remote = config
-		? await readRemoteLatest(config, backendOverride).catch((error) => ({
-				error: errorMessage(error),
-			}))
-		: undefined;
-	const summary = {
-		...local,
-		configPath: configPath(agentDir),
-		configured: Boolean(config),
-		remote,
-		comparison: compareRemote(local.contentSha256, remote),
-	};
-	if (flags.has("--json")) return ok(JSON.stringify(summary, null, 2), summary);
-	const lines = [formatSummary("Local status", local)];
-	if (!config)
-		lines.push(
-			`No WebDAV config found. Run /webdav-sync init or edit ${configPath(agentDir)}`,
-		);
-	else lines.push(formatRemote(remote));
-	return ok(lines.join("\n"), summary);
 }
 
 async function commandPush(
@@ -164,169 +62,130 @@ async function commandPush(
 	backendOverride?: SyncBackend,
 ): Promise<CommandResult> {
 	const dryRun = flags.has("--dry-run");
-	const summary = await buildLocalSummary(agentDir);
-	if (dryRun) {
-		if (flags.has("--json"))
-			return ok(JSON.stringify(summary, null, 2), summary);
-		return ok(formatSummary("Dry-run push (no upload)", summary), summary);
-	}
-	if (!flags.has("--yes")) return fail("push requires --yes or --dry-run");
-	const config = await requireConfig(agentDir);
-	const backend = backendOverride || createWebdavBackend(config);
 	const collected = await collectAgentArchive(agentDir);
 	const zip = createLatestZip(collected.zipEntries, collected.manifest);
+	const result = pushSummary(zip.latest, zip.zipBytes.byteLength);
+	if (dryRun) return ok(formatPush("push: dry-run", result), result);
+	if (!flags.has("--yes")) return fail("push requires --yes or --dry-run");
+
+	const config = await requireConfig(agentDir);
+	const backend = backendOverride || createWebdavBackend(config);
+	const snapshotId = snapshotIdFromDate(new Date(zip.latest.createdAt));
+	const snapshotZip = `snapshots/${snapshotId}.zip`;
+	const snapshotJson = `snapshots/${snapshotId}.json`;
 	await backend.putBytes("latest.zip", zip.zipBytes);
 	await backend.putJson("latest.json", zip.latest);
-	const result = {
-		fileCount: zip.latest.fileCount,
-		externalResourceCount: zip.latest.externalResourceCount,
-		contentSha256: zip.latest.contentSha256,
-		zipSha256: zip.latest.zipSha256,
-	};
-	if (flags.has("--json")) return ok(JSON.stringify(result, null, 2), result);
-	return ok(
-		[
-			"push: ok",
-			`files: ${result.fileCount}`,
-			`external: ${result.externalResourceCount}`,
-			`hash: ${shortHash(result.contentSha256)}`,
-		].join("\n"),
-		result,
-	);
+	await backend.putBytes(snapshotZip, zip.zipBytes);
+	await backend.putJson(snapshotJson, { ...zip.latest, snapshotId, zip: snapshotZip });
+	return ok(formatPush("push: ok", result), result);
 }
 
 async function commandPull(
 	agentDir: string,
 	flags: Flags,
-	backendOverride?: SyncBackend,
+	context: CommandContext,
 ): Promise<CommandResult> {
 	const dryRun = flags.has("--dry-run");
-	if (!dryRun && !flags.has("--yes"))
-		return fail("pull requires --yes or --dry-run");
+	if (!dryRun && !flags.has("--yes")) return fail("pull requires --yes or --dry-run");
 	const config = await requireConfig(agentDir);
-	const backend = backendOverride || createWebdavBackend(config);
-	const latest = await backend.getJson<LatestIndex>("latest.json");
-	const zipBytes = await backend.getBytes("latest.zip");
+	const backend = context.backend || createWebdavBackend(config);
+	const snapshot = await chooseSnapshot(backend, flags, context.selectSnapshot);
+	const latest = await backend.getJson<LatestIndex>(snapshot.jsonPath);
+	const zipBytes = await backend.getBytes(snapshot.zipPath);
 	const archive = parseArchive(zipBytes, latest.zipSha256);
 	validateLatestMatchesManifest(latest, archive);
 	const diff = await diffArchiveAgainstLocal(agentDir, archive);
 	const packages = missingInstallSpecs(await settingsJsonFromArchive(archive));
-	const summary = { remote: latest, diff, packageSpecs: packages };
-	if (dryRun) {
-		if (flags.has("--json"))
-			return ok(JSON.stringify(summary, null, 2), summary);
-		return ok(
-			formatPullPlan("Dry-run pull (no changes)", latest, diff, packages),
-			summary,
-		);
-	}
+	const summary = { snapshot: snapshot.id, remote: latest, diff, packageSpecs: packages };
+	if (dryRun) return ok(formatPull("pull: dry-run", snapshot.id, latest, diff, packages), summary);
+
 	const backup = await createLocalBackup(agentDir, config.backupRetention ?? 5);
 	const applied = await applyArchiveToAgent(agentDir, archive);
-	const installResults =
-		flags.has("--install-missing") || config.installMissingPackages === "always"
-			? await installPackages(packages)
-			: [];
-	const result = { backup, applied, packageSpecs: packages, installResults };
+	const installResults = flags.has("--install-missing") || config.installMissingPackages === "always"
+		? await installPackages(packages)
+		: [];
 	const lines = [
-		"pull: ok",
+		`pull: ${snapshot.id}`,
 		`backup: ${backup.id}`,
 		`files: ${applied.filesWritten}`,
 		`external: ${applied.externalFilesWritten}`,
 		`hash: ${shortHash(archive.manifest.contentSha256)}`,
 	];
-	if (packages.length && !installResults.length)
-		lines.push(`packages: ${packages.length} not installed; rerun with --install-missing`);
+	if (packages.length && !installResults.length) lines.push(`packages: ${packages.length} not installed; rerun with --install-missing`);
 	if (installResults.length) {
 		const failed = installResults.filter((item) => !item.ok).length;
 		lines.push(`packages: ${installResults.length - failed} installed, ${failed} failed`);
 	}
-	return ok(lines.join("\n"), result);
+	return ok(lines.join("\n"), { ...summary, backup, applied, installResults });
 }
 
-async function commandRestore(
-	agentDir: string,
-	args: string[],
+async function chooseSnapshot(
+	backend: SyncBackend,
 	flags: Flags,
-): Promise<CommandResult> {
-	const id = args.find((arg) => !arg.startsWith("--")) || "latest";
-	const dryRun = flags.has("--dry-run");
-	if (!dryRun && !flags.has("--yes"))
-		return fail("restore requires --yes or --dry-run");
-	const { record, archive } = await loadBackup(agentDir, id);
-	const diff = await diffArchiveAgainstLocal(agentDir, archive);
-	if (dryRun)
-		return ok(
-			formatPullPlan(
-				`Dry-run restore ${record.id} (no changes)`,
-				createLatestIndex(archive.manifest, await fs.readFile(record.zipPath)),
-				diff,
-				[],
-			),
-			{ backup: record, diff },
-		);
-	const applied = await applyArchiveToAgent(agentDir, archive);
-	return ok(
-		[
-			`restore: ${record.id}`,
-			`files: ${applied.filesWritten}`,
-			`external: ${applied.externalFilesWritten}`,
-		].join("\n"),
-		{ backup: record, applied },
-	);
+	selectSnapshot?: (choices: SnapshotChoice[]) => Promise<string | undefined>,
+): Promise<{ id: string; jsonPath: string; zipPath: string }> {
+	const explicit = valueFlag(flags, "--snapshot");
+	if (explicit) return snapshotPaths(explicit);
+	const choices = await listSnapshots(backend);
+	if (choices.length <= 1) return snapshotPaths("latest");
+	if (!selectSnapshot) return snapshotPaths("latest");
+	const selected = await selectSnapshot(choices.map(({ id, label }) => ({ id, label })));
+	return snapshotPaths(selected || "latest");
 }
 
-async function buildLocalSummary(agentDirInput?: string) {
-	const agentDir = getAgentDir(agentDirInput);
-	const collected = await collectAgentArchive(agentDir);
-	const zip = createLatestZip(collected.zipEntries, collected.manifest);
+async function listSnapshots(backend: SyncBackend): Promise<SnapshotChoice[]> {
+	const out: SnapshotChoice[] = [{ id: "latest", label: "latest" }];
+	let entries: RemoteListEntry[] = [];
+	try {
+		entries = await backend.list("snapshots");
+	} catch {
+		return out;
+	}
+	for (const entry of entries) {
+		const name = entry.path.split(/[\\/]/).pop() || entry.path;
+		if (!name.endsWith(".json")) continue;
+		const id = name.slice(0, -5);
+		out.push({ id, label: `${id}${entry.lastModified ? ` · ${entry.lastModified}` : ""}` });
+	}
+	return uniqueById(out).sort((a, b) => (a.id === "latest" ? -1 : b.id === "latest" ? 1 : b.id.localeCompare(a.id)));
+}
+
+function snapshotPaths(id: string): { id: string; jsonPath: string; zipPath: string } {
+	if (id === "latest") return { id, jsonPath: "latest.json", zipPath: "latest.zip" };
+	const safe = id.replace(/\.json$|\.zip$/g, "");
+	return { id: safe, jsonPath: `snapshots/${safe}.json`, zipPath: `snapshots/${safe}.zip` };
+}
+
+function pushSummary(latest: LatestIndex, zipBytes: number) {
 	return {
-		agentDir,
-		fileCount: collected.manifest.files.length,
-		externalResourceCount: collected.manifest.externalResources.length,
-		warningCount: collected.warnings.length,
-		contentSha256: collected.manifest.contentSha256,
-		contentHash: shortHash(collected.manifest.contentSha256),
-		zipSha256: zip.latest.zipSha256,
-		zipHash: shortHash(zip.latest.zipSha256),
-		zipBytes: zip.zipBytes.byteLength,
-		packageSpecs: collected.manifest.packageSpecs,
-		files: collected.manifest.files.map((file) => ({
-			path: file.path,
-			size: file.size,
-			sha256: shortHash(file.sha256),
-		})),
-		externalResources: collected.manifest.externalResources.map((resource) => ({
-			id: resource.id,
-			baseName: resource.baseName,
-			fileCount: resource.files.length,
-		})),
-		warnings: collected.warnings,
+		fileCount: latest.fileCount,
+		externalResourceCount: latest.externalResourceCount,
+		packageCount: latest.packageSpecs.length,
+		contentSha256: latest.contentSha256,
+		zipBytes,
 	};
 }
 
-function formatSummary(
-	title: string,
-	summary: Awaited<ReturnType<typeof buildLocalSummary>>,
-): string {
-	const lines = [
+function formatPush(title: string, result: ReturnType<typeof pushSummary>): string {
+	return [
 		title,
-		`files: ${summary.fileCount}`,
-		`external: ${summary.externalResourceCount}`,
-		`packages: ${summary.packageSpecs.length}`,
-		`hash: ${summary.contentHash}`,
-	];
-	if (summary.warnings.length) lines.push(`warnings: ${summary.warnings.length}`);
-	return lines.join("\n");
+		`files: ${result.fileCount}`,
+		`external: ${result.externalResourceCount}`,
+		`packages: ${result.packageCount}`,
+		`hash: ${shortHash(result.contentSha256)}`,
+	].join("\n");
 }
 
-function formatPullPlan(
+function formatPull(
 	title: string,
+	snapshot: string,
 	latest: LatestIndex,
 	diff: Awaited<ReturnType<typeof diffArchiveAgainstLocal>>,
 	packages: string[],
 ): string {
 	return [
 		title,
+		`snapshot: ${snapshot}`,
 		`files: ${latest.fileCount}`,
 		`external: ${latest.externalResourceCount}`,
 		`changes: +${diff.add.length}/~${diff.modify.length}/-${diff.remove.length}`,
@@ -336,79 +195,30 @@ function formatPullPlan(
 	].join("\n");
 }
 
-async function readRemoteLatest(
-	config: WebdavSyncConfig,
-	backendOverride?: SyncBackend,
-): Promise<LatestIndex | { empty: true }> {
-	const backend = backendOverride || createWebdavBackend(config);
-	if (!(await backend.exists("latest.json"))) return { empty: true };
-	return backend.getJson<LatestIndex>("latest.json");
-}
-
-function formatRemote(remote: unknown): string {
-	if (!remote) return "remote: not checked";
-	if (typeof remote === "object" && "error" in remote)
-		return `remote error: ${(remote as { error: string }).error}`;
-	if (typeof remote === "object" && "empty" in remote) return "remote: empty";
-	const latest = remote as LatestIndex;
-	return [
-		`remote: ${latest.fileCount} files, ${latest.externalResourceCount} external, ${latest.packageSpecs.length} packages`,
-		`remoteHash: ${shortHash(latest.contentSha256)}`,
-	].join("\n");
-}
-
-function compareRemote(localHash: string, remote: unknown): string {
-	if (!remote || typeof remote !== "object" || !("contentSha256" in remote))
-		return "unknown";
-	return (remote as LatestIndex).contentSha256 === localHash
-		? "same"
-		: "different";
-}
-
 async function requireConfig(agentDir: string): Promise<WebdavSyncConfig> {
 	const config = await readConfig(agentDir);
-	if (!config)
-		throw new Error(
-			`WebDAV config not found. Run /webdav-sync init or edit ${configPath(agentDir)}`,
-		);
-	if (!config.remoteBaseUrl)
-		throw new Error("config.remoteBaseUrl is required");
+	if (!config) throw new Error(`WebDAV config not found. Create ${configPath(agentDir)}`);
+	if (!config.remoteBaseUrl) throw new Error("config.remoteBaseUrl is required");
 	return config;
 }
 
-function validateLatestMatchesManifest(
-	latest: LatestIndex,
-	archive: ParsedArchive,
-): void {
+function validateLatestMatchesManifest(latest: LatestIndex, archive: ParsedArchive): void {
 	const expected = createLatestIndex(archive.manifest, new Uint8Array());
 	const mismatches: string[] = [];
-	if (latest.contentSha256 !== expected.contentSha256)
-		mismatches.push("contentSha256");
+	if (latest.contentSha256 !== expected.contentSha256) mismatches.push("contentSha256");
 	if (latest.fileCount !== expected.fileCount) mismatches.push("fileCount");
-	if (latest.externalResourceCount !== expected.externalResourceCount)
-		mismatches.push("externalResourceCount");
-	if (
-		JSON.stringify(latest.packageSpecs) !==
-		JSON.stringify(expected.packageSpecs)
-	)
-		mismatches.push("packageSpecs");
-	if (mismatches.length)
-		throw new Error(
-			`latest.json does not match archive manifest: ${mismatches.join(", ")}`,
-		);
+	if (latest.externalResourceCount !== expected.externalResourceCount) mismatches.push("externalResourceCount");
+	if (JSON.stringify(latest.packageSpecs) !== JSON.stringify(expected.packageSpecs)) mismatches.push("packageSpecs");
+	if (mismatches.length) throw new Error(`latest.json does not match archive manifest: ${mismatches.join(", ")}`);
 }
 
-async function settingsJsonFromArchive(
-	archive: ParsedArchive,
-): Promise<unknown> {
+async function settingsJsonFromArchive(archive: ParsedArchive): Promise<unknown> {
 	const bytes = archive.entries.get("files/settings.json");
 	if (!bytes) return undefined;
 	return JSON.parse(bytes.toString("utf8"));
 }
 
-async function installPackages(
-	specs: string[],
-): Promise<Array<{ spec: string; ok: boolean; code: number | null }>> {
+async function installPackages(specs: string[]): Promise<Array<{ spec: string; ok: boolean; code: number | null }>> {
 	const results = [];
 	for (const spec of specs) {
 		const code = await runPiInstall(spec);
@@ -419,28 +229,37 @@ async function installPackages(
 
 function runPiInstall(spec: string): Promise<number | null> {
 	return new Promise((resolve) => {
-		const child = spawn("pi", ["install", spec], {
-			stdio: "ignore",
-			shell: process.platform === "win32",
-		});
+		const child = spawn("pi", ["install", spec], { stdio: "ignore", shell: process.platform === "win32" });
 		child.on("error", () => resolve(-1));
 		child.on("close", (code) => resolve(code));
 	});
 }
 
-function parseAssignments(args: string[]): Record<string, string> {
-	const out: Record<string, string> = {};
-	for (const arg of args) {
-		if (arg.startsWith("--")) continue;
-		const index = arg.indexOf("=");
-		if (index <= 0) continue;
-		out[arg.slice(0, index)] = arg.slice(index + 1);
+function valueFlag(flags: Flags, name: string): string | undefined {
+	for (const flag of flags) {
+		if (flag.startsWith(`${name}=`)) return flag.slice(name.length + 1);
 	}
-	return out;
+	return undefined;
 }
 
-function isInstallPolicy(value: string): value is "ask" | "always" | "never" {
-	return value === "ask" || value === "always" || value === "never";
+function normalizeCommand(raw: string): "push" | "pull" | "help" {
+	const value = raw.replace(/^webdav-sync:/, "").replace(/^:/, "");
+	if (value === "push") return "push";
+	if (value === "pull") return "pull";
+	return "help";
+}
+
+function uniqueById(items: SnapshotChoice[]): SnapshotChoice[] {
+	const seen = new Set<string>();
+	return items.filter((item) => {
+		if (seen.has(item.id)) return false;
+		seen.add(item.id);
+		return true;
+	});
+}
+
+function snapshotIdFromDate(date: Date): string {
+	return date.toISOString().replace(/[:.]/g, "-");
 }
 
 function ok(text: string, data?: unknown): CommandResult {
@@ -451,19 +270,12 @@ function fail(text: string): CommandResult {
 	return { ok: false, text };
 }
 
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
 function helpText(): string {
 	return [
-		"/webdav-sync status",
-		"/webdav-sync push --dry-run",
-		"/webdav-sync push --yes",
-		"/webdav-sync pull --dry-run",
-		"/webdav-sync pull --yes [--install-missing]",
-		"/webdav-sync restore latest --yes",
-		"/webdav-sync init key=value...",
+		"/webdav-sync:push --dry-run",
+		"/webdav-sync:push --yes",
+		"/webdav-sync:pull --dry-run",
+		"/webdav-sync:pull --yes [--install-missing] [--snapshot=<id>]",
 	].join("\n");
 }
 
@@ -473,16 +285,11 @@ function splitArgs(input: string): string[] {
 
 function extractInput(args: unknown[]): string[] {
 	for (const arg of args) {
-		if (Array.isArray(arg) && arg.every((item) => typeof item === "string"))
-			return arg;
+		if (Array.isArray(arg) && arg.every((item) => typeof item === "string")) return arg;
 		if (typeof arg === "string") return splitArgs(arg);
 		if (arg && typeof arg === "object") {
 			const record = arg as Record<string, unknown>;
-			if (
-				Array.isArray(record.args) &&
-				record.args.every((item) => typeof item === "string")
-			)
-				return record.args;
+			if (Array.isArray(record.args) && record.args.every((item) => typeof item === "string")) return record.args;
 			if (typeof record.input === "string") return splitArgs(record.input);
 			if (typeof record.prompt === "string") return splitArgs(record.prompt);
 		}
