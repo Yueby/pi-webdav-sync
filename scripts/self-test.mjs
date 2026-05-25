@@ -153,6 +153,12 @@ try {
 		!rewrittenSettings.includes(externalDir),
 		"rewritten settings should not keep external absolute path",
 	);
+	for (const key of ["shellPath", "npmCommand", "sessionDir"]) {
+		assert(
+			!rewrittenSettings.includes(key),
+			`local-only ${key} should be omitted from rewritten settings`,
+		);
+	}
 
 	for (const entry of zipEntries) {
 		assert(!entry.startsWith("/"), `zip entry must not be absolute: ${entry}`);
@@ -210,12 +216,24 @@ try {
 	const remoteKeys = [...backend.files.keys()].sort();
 	assert.equal(remoteKeys[0], "latest.json");
 	assert.equal(remoteKeys[1], "latest.zip");
-	assert.equal(remoteKeys.filter((key) => key.startsWith("snapshots/") && key.endsWith(".json")).length, 1);
-	assert.equal(remoteKeys.filter((key) => key.startsWith("snapshots/") && key.endsWith(".zip")).length, 1);
+	assert.equal(
+		remoteKeys.filter(
+			(key) => key.startsWith("snapshots/") && key.endsWith(".json"),
+		).length,
+		1,
+	);
+	assert.equal(
+		remoteKeys.filter(
+			(key) => key.startsWith("snapshots/") && key.endsWith(".zip"),
+		).length,
+		1,
+	);
 
 	await seedTargetAgent(targetAgent);
 	await writeTestConfig(targetAgent);
 	let selectedSnapshot;
+	let askedToInstall;
+	const installedSpecs = [];
 	const pull = await runWebdavSyncCommand(["pull"], {
 		agentDir: targetAgent,
 		backend,
@@ -223,9 +241,30 @@ try {
 			selectedSnapshot = choices[1]?.id;
 			return selectedSnapshot;
 		},
+		confirmInstallPackages: async (specs) => {
+			askedToInstall = specs;
+			return true;
+		},
+		installPackage: async (spec) => {
+			installedSpecs.push(spec);
+			return 0;
+		},
 	});
 	assert.equal(pull.ok, true, "pull should apply archive");
-	assert(selectedSnapshot?.startsWith("20"), "pull should expose snapshot choices");
+	assert(
+		selectedSnapshot?.startsWith("20"),
+		"pull should expose snapshot choices",
+	);
+	assert.deepEqual(
+		askedToInstall,
+		["npm:pi-web-access", "pi-skills"],
+		"ask mode should prompt for snapshot packages",
+	);
+	assert.deepEqual(
+		installedSpecs,
+		["npm:pi-web-access", "pi-skills"],
+		"ask mode should install packages when confirmed",
+	);
 	assert.equal(
 		await fs.readFile(path.join(targetAgent, "AGENTS.md"), "utf8"),
 		"agent rules\n",
@@ -271,6 +310,12 @@ try {
 		!pulledSettings.includes(externalDir),
 		"pulled settings should not contain source absolute external path",
 	);
+	for (const key of ["shellPath", "npmCommand", "sessionDir"]) {
+		assert(
+			!pulledSettings.includes(key),
+			`pulled settings should not restore local-only ${key}`,
+		);
+	}
 
 	const backups = await fs.readdir(
 		path.join(targetAgent, ".webdav-sync", "backups"),
@@ -340,7 +385,10 @@ async function seedSourceAgent(agentDir, externalDir) {
 		"bad\n",
 	);
 	await fs.writeFile(path.join(agentDir, "sessions", "session.json"), "bad\n");
-	await fs.writeFile(path.join(agentDir, ".webdav-sync", "state.json"), "bad\n");
+	await fs.writeFile(
+		path.join(agentDir, ".webdav-sync", "state.json"),
+		"bad\n",
+	);
 	await fs.writeFile(path.join(agentDir, "pi-crash.log"), "bad\n");
 	await fs.writeFile(
 		path.join(externalDir, "package.json"),
@@ -363,6 +411,9 @@ async function seedSourceAgent(agentDir, externalDir) {
 					{ source: externalDir, extensions: ["x"] },
 				],
 				skills: [path.join(externalDir, "src")],
+				shellPath: "/local/only/shell",
+				npmCommand: ["local-node-manager", "npm"],
+				sessionDir: "/local/only/sessions",
 			},
 			null,
 			2,

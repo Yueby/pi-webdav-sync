@@ -41,6 +41,11 @@ type RewriteContext = {
 };
 
 const RESOURCE_KEYS = ["extensions", "skills", "prompts", "themes"] as const;
+const LOCAL_ONLY_SETTINGS_KEYS = [
+	"shellPath",
+	"npmCommand",
+	"sessionDir",
+] as const;
 
 export async function rewriteSettingsFile(
 	agentDir: string,
@@ -69,6 +74,7 @@ export async function rewriteSettingsFile(
 		warnings: [],
 	};
 	const root = { ...(parsed as Record<string, unknown>) };
+	for (const key of LOCAL_ONLY_SETTINGS_KEYS) delete root[key];
 
 	if (Array.isArray(root.packages)) {
 		root.packages = root.packages.map((entry) =>

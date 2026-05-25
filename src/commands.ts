@@ -1,11 +1,19 @@
 import { spawn } from "node:child_process";
-import { createLocalBackup, applyArchiveToAgent, diffArchiveAgainstLocal } from "./backup.js";
+import {
+	createLocalBackup,
+	applyArchiveToAgent,
+	diffArchiveAgainstLocal,
+} from "./backup.js";
 import { collectAgentArchive } from "./collector.js";
 import { configPath, readConfig, type WebdavSyncConfig } from "./config.js";
 import { createLatestIndex, type LatestIndex, shortHash } from "./manifest.js";
 import { getAgentDir } from "./paths.js";
 import { missingInstallSpecs } from "./package-specs.js";
-import { createLatestZip, parseArchive, type ParsedArchive } from "./zip-store.js";
+import {
+	createLatestZip,
+	parseArchive,
+	type ParsedArchive,
+} from "./zip-store.js";
 import { createWebdavBackend } from "./backends/webdav.js";
 import type { RemoteListEntry, SyncBackend } from "./backends/types.js";
 
@@ -19,6 +27,18 @@ export type CommandContext = {
 	agentDir?: string;
 	backend?: SyncBackend;
 	selectSnapshot?: (choices: SnapshotChoice[]) => Promise<string | undefined>;
+	confirmInstallPackages?: (specs: string[]) => Promise<boolean>;
+	installPackage?: (spec: string) => Promise<number | null>;
+	onInstallProgress?: (progress: InstallProgress) => void;
+};
+
+export type InstallProgress = {
+	phase: "start" | "package_start" | "package_done" | "done";
+	spec?: string;
+	index?: number;
+	total: number;
+	ok?: boolean;
+	code?: number | null;
 };
 
 export type SnapshotChoice = {
@@ -30,7 +50,9 @@ export async function runWebdavSyncCommand(
 	input: string | string[] = [],
 	context: CommandContext = {},
 ): Promise<CommandResult> {
-	const command = normalizeCommand(Array.isArray(input) ? input[0] : splitArgs(input)[0]);
+	const command = normalizeCommand(
+		Array.isArray(input) ? input[0] : splitArgs(input)[0],
+	);
 	const agentDir = getAgentDir(context.agentDir);
 	try {
 		if (command === "push") return await commandPush(agentDir, context.backend);
@@ -41,13 +63,18 @@ export async function runWebdavSyncCommand(
 	}
 }
 
-export async function handleWebdavSyncCommand(...args: unknown[]): Promise<string> {
+export async function handleWebdavSyncCommand(
+	...args: unknown[]
+): Promise<string> {
 	const input = extractInput(args);
 	const result = await runWebdavSyncCommand(input);
 	return result.text;
 }
 
-async function commandPush(agentDir: string, backendOverride?: SyncBackend): Promise<CommandResult> {
+async function commandPush(
+	agentDir: string,
+	backendOverride?: SyncBackend,
+): Promise<CommandResult> {
 	const collected = await collectAgentArchive(agentDir);
 	const zip = createLatestZip(collected.zipEntries, collected.manifest);
 	const config = await requireConfig(agentDir);
@@ -58,7 +85,11 @@ async function commandPush(agentDir: string, backendOverride?: SyncBackend): Pro
 	await backend.putBytes("latest.zip", zip.zipBytes);
 	await backend.putJson("latest.json", zip.latest);
 	await backend.putBytes(snapshotZip, zip.zipBytes);
-	await backend.putJson(snapshotJson, { ...zip.latest, snapshotId, zip: snapshotZip });
+	await backend.putJson(snapshotJson, {
+		...zip.latest,
+		snapshotId,
+		zip: snapshotZip,
+	});
 	return ok(
 		[
 			"push: ok",
@@ -71,7 +102,10 @@ async function commandPush(agentDir: string, backendOverride?: SyncBackend): Pro
 	);
 }
 
-async function commandPull(agentDir: string, context: CommandContext): Promise<CommandResult> {
+async function commandPull(
+	agentDir: string,
+	context: CommandContext,
+): Promise<CommandResult> {
 	const config = await requireConfig(agentDir);
 	const backend = context.backend || createWebdavBackend(config);
 	const snapshot = await chooseSnapshot(backend, context.selectSnapshot);
@@ -83,7 +117,18 @@ async function commandPull(agentDir: string, context: CommandContext): Promise<C
 	const packages = missingInstallSpecs(await settingsJsonFromArchive(archive));
 	const backup = await createLocalBackup(agentDir, config.backupRetention ?? 5);
 	const applied = await applyArchiveToAgent(agentDir, archive);
-	const installResults = config.installMissingPackages === "always" ? await installPackages(packages) : [];
+	const shouldInstall = await shouldInstallPackages(
+		packages,
+		config,
+		context.confirmInstallPackages,
+	);
+	const installResults = shouldInstall
+		? await installPackages(
+				packages,
+				context.installPackage,
+				context.onInstallProgress,
+			)
+		: [];
 	const lines = [
 		`pull: ${snapshot.id}`,
 		`backup: ${backup.id}`,
@@ -92,12 +137,20 @@ async function commandPull(agentDir: string, context: CommandContext): Promise<C
 		`changes: +${diff.add.length}/~${diff.modify.length}/-${diff.remove.length}`,
 		`hash: ${shortHash(archive.manifest.contentSha256)}`,
 	];
-	if (packages.length && !installResults.length) lines.push(`packages: ${packages.length} not installed`);
+	if (packages.length && !installResults.length)
+		lines.push(`packages: ${packages.length} not installed`);
 	if (installResults.length) {
 		const failed = installResults.filter((item) => !item.ok).length;
-		lines.push(`packages: ${installResults.length - failed} installed, ${failed} failed`);
+		lines.push(
+			`packages: ${installResults.length - failed} installed, ${failed} failed`,
+		);
 	}
-	return ok(lines.join("\n"), { snapshot: snapshot.id, backup, applied, packages });
+	return ok(lines.join("\n"), {
+		snapshot: snapshot.id,
+		backup,
+		applied,
+		packages,
+	});
 }
 
 async function chooseSnapshot(
@@ -122,52 +175,112 @@ async function listSnapshots(backend: SyncBackend): Promise<SnapshotChoice[]> {
 		const name = entry.path.split(/[\\/]/).pop() || entry.path;
 		if (!name.endsWith(".json")) continue;
 		const id = name.slice(0, -5);
-		out.push({ id, label: `${id}${entry.lastModified ? ` · ${entry.lastModified}` : ""}` });
+		out.push({
+			id,
+			label: `${id}${entry.lastModified ? ` · ${entry.lastModified}` : ""}`,
+		});
 	}
-	return uniqueById(out).sort((a, b) => (a.id === "latest" ? -1 : b.id === "latest" ? 1 : b.id.localeCompare(a.id)));
+	return uniqueById(out).sort((a, b) =>
+		a.id === "latest" ? -1 : b.id === "latest" ? 1 : b.id.localeCompare(a.id),
+	);
 }
 
-function snapshotPaths(id: string): { id: string; jsonPath: string; zipPath: string } {
-	if (id === "latest") return { id, jsonPath: "latest.json", zipPath: "latest.zip" };
+function snapshotPaths(id: string): {
+	id: string;
+	jsonPath: string;
+	zipPath: string;
+} {
+	if (id === "latest")
+		return { id, jsonPath: "latest.json", zipPath: "latest.zip" };
 	const safe = id.replace(/\.json$|\.zip$/g, "");
-	return { id: safe, jsonPath: `snapshots/${safe}.json`, zipPath: `snapshots/${safe}.zip` };
+	return {
+		id: safe,
+		jsonPath: `snapshots/${safe}.json`,
+		zipPath: `snapshots/${safe}.zip`,
+	};
 }
 
 async function requireConfig(agentDir: string): Promise<WebdavSyncConfig> {
 	const config = await readConfig(agentDir);
-	if (!config) throw new Error(`WebDAV config not found. Create ${configPath(agentDir)}`);
-	if (!config.remoteBaseUrl) throw new Error("config.remoteBaseUrl is required");
+	if (!config)
+		throw new Error(`WebDAV config not found. Create ${configPath(agentDir)}`);
+	if (!config.remoteBaseUrl)
+		throw new Error("config.remoteBaseUrl is required");
 	return config;
 }
 
-function validateLatestMatchesManifest(latest: LatestIndex, archive: ParsedArchive): void {
+function validateLatestMatchesManifest(
+	latest: LatestIndex,
+	archive: ParsedArchive,
+): void {
 	const expected = createLatestIndex(archive.manifest, new Uint8Array());
 	const mismatches: string[] = [];
-	if (latest.contentSha256 !== expected.contentSha256) mismatches.push("contentSha256");
+	if (latest.contentSha256 !== expected.contentSha256)
+		mismatches.push("contentSha256");
 	if (latest.fileCount !== expected.fileCount) mismatches.push("fileCount");
-	if (latest.externalResourceCount !== expected.externalResourceCount) mismatches.push("externalResourceCount");
-	if (JSON.stringify(latest.packageSpecs) !== JSON.stringify(expected.packageSpecs)) mismatches.push("packageSpecs");
-	if (mismatches.length) throw new Error(`latest.json does not match archive manifest: ${mismatches.join(", ")}`);
+	if (latest.externalResourceCount !== expected.externalResourceCount)
+		mismatches.push("externalResourceCount");
+	if (
+		JSON.stringify(latest.packageSpecs) !==
+		JSON.stringify(expected.packageSpecs)
+	)
+		mismatches.push("packageSpecs");
+	if (mismatches.length)
+		throw new Error(
+			`latest.json does not match archive manifest: ${mismatches.join(", ")}`,
+		);
 }
 
-async function settingsJsonFromArchive(archive: ParsedArchive): Promise<unknown> {
+async function settingsJsonFromArchive(
+	archive: ParsedArchive,
+): Promise<unknown> {
 	const bytes = archive.entries.get("files/settings.json");
 	if (!bytes) return undefined;
 	return JSON.parse(bytes.toString("utf8"));
 }
 
-async function installPackages(specs: string[]): Promise<Array<{ spec: string; ok: boolean; code: number | null }>> {
+async function shouldInstallPackages(
+	specs: string[],
+	config: WebdavSyncConfig,
+	confirmInstallPackages?: (specs: string[]) => Promise<boolean>,
+): Promise<boolean> {
+	if (!specs.length) return false;
+	if (config.installMissingPackages === "always") return true;
+	if (config.installMissingPackages === "never") return false;
+	return confirmInstallPackages ? confirmInstallPackages(specs) : false;
+}
+
+async function installPackages(
+	specs: string[],
+	installPackage = runPiInstall,
+	onProgress?: (progress: InstallProgress) => void,
+): Promise<Array<{ spec: string; ok: boolean; code: number | null }>> {
 	const results = [];
-	for (const spec of specs) {
-		const code = await runPiInstall(spec);
-		results.push({ spec, ok: code === 0, code });
+	onProgress?.({ phase: "start", total: specs.length });
+	for (const [index, spec] of specs.entries()) {
+		onProgress?.({ phase: "package_start", spec, index, total: specs.length });
+		const code = await installPackage(spec);
+		const ok = code === 0;
+		results.push({ spec, ok, code });
+		onProgress?.({
+			phase: "package_done",
+			spec,
+			index,
+			total: specs.length,
+			ok,
+			code,
+		});
 	}
+	onProgress?.({ phase: "done", total: specs.length });
 	return results;
 }
 
 function runPiInstall(spec: string): Promise<number | null> {
 	return new Promise((resolve) => {
-		const child = spawn("pi", ["install", spec], { stdio: "ignore", shell: process.platform === "win32" });
+		const child = spawn("pi", ["install", spec], {
+			stdio: "ignore",
+			shell: process.platform === "win32",
+		});
 		child.on("error", () => resolve(-1));
 		child.on("close", (code) => resolve(code));
 	});
@@ -211,11 +324,16 @@ function splitArgs(input: string): string[] {
 
 function extractInput(args: unknown[]): string[] {
 	for (const arg of args) {
-		if (Array.isArray(arg) && arg.every((item) => typeof item === "string")) return arg;
+		if (Array.isArray(arg) && arg.every((item) => typeof item === "string"))
+			return arg;
 		if (typeof arg === "string") return splitArgs(arg);
 		if (arg && typeof arg === "object") {
 			const record = arg as Record<string, unknown>;
-			if (Array.isArray(record.args) && record.args.every((item) => typeof item === "string")) return record.args;
+			if (
+				Array.isArray(record.args) &&
+				record.args.every((item) => typeof item === "string")
+			)
+				return record.args;
 			if (typeof record.input === "string") return splitArgs(record.input);
 			if (typeof record.prompt === "string") return splitArgs(record.prompt);
 		}
