@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.pi-lens/
+*.tgz
+*.log
+.DS_Store

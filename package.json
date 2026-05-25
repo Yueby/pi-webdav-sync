@@ -1,0 +1,46 @@
+{
+  "name": "pi-webdav-sync",
+  "version": "0.1.0",
+  "description": "WebDAV backup and restore for Pi personal configuration.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./src/extension.ts",
+  "files": [
+    "src/",
+    "README.md",
+    "package.json"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "webdav",
+    "sync",
+    "backup"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node scripts/self-test.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2",
+    "webdav": "^5.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "typescript": "^5.8.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  }
+}
