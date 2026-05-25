@@ -13,7 +13,7 @@ npm test
 Install into Pi from this checkout, then reload Pi:
 
 ```bash
-pi install E:/Projects/Pi/pi-webdav-sync
+pi install npm:pi-webdav-sync
 ```
 
 ## Configure
@@ -30,10 +30,17 @@ Write minimal config with arguments:
 /webdav-sync init url=https://dav.example.com/pi-agent-sync/ username=you passwordEnv=PI_WEBDAV_PASSWORD remoteDir=/
 ```
 
-Config is saved under excluded local state:
+Config, backups, and internal state live under one hidden directory in your home folder, outside the Pi agent config tree:
 
 ```text
-~/.pi/agent/webdav-sync/config.json
+~/.pi-webdav-sync/config.json
+~/.pi-webdav-sync/backups/
+```
+
+Set `PI_WEBDAV_SYNC_DIR` if you want a different local state directory.
+
+```text
+PI_WEBDAV_SYNC_DIR=/path/to/state
 ```
 
 Supported fields include `remoteBaseUrl` (or init alias `url`), `username`, `passwordEnv`, `password` (less safe fallback), `remoteDir`, `installMissingPackages`, and `backupRetention`.
@@ -72,7 +79,7 @@ Allowlist directories:
 
 Always excluded at any depth:
 
-- `npm/`, `git/`, `node_modules/`, `sessions/`, `cache/`, `logs/`, `webdav-sync/`, `.git/`
+- `npm/`, `git/`, `node_modules/`, `sessions/`, `cache/`, `logs/`, `webdav-sync/`, `.webdav-sync/`, `.git/`
 - log files and temporary files
 - symlinks are not followed; they are reported as warnings
 
@@ -87,7 +94,7 @@ Pull restores external resources to `~/.pi/agent/external-resources/...` so the 
 Before non-dry-run `pull`, the current local allowlist state is saved to:
 
 ```text
-~/.pi/agent/webdav-sync/backups/<timestamp>/backup.zip
+~/.pi-webdav-sync/backups/<timestamp>/backup.zip
 ```
 
 Use `/webdav-sync restore latest --yes` to revert to the latest local backup. Backups and plugin config are excluded from sync.

@@ -22,10 +22,11 @@ const EXCLUDED_DIR_NAMES = new Set([
   "cache",
   "logs",
   "webdav-sync",
+  ".webdav-sync",
   ".git",
 ]);
 
-const EXCLUDED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db"]);
+const EXCLUDED_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "webdav-sync.json"]);
 
 export function getAgentDir(explicit?: string): string {
   const value = explicit || process.env.PI_CODING_AGENT_DIR || process.env.PI_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");

@@ -48,6 +48,8 @@ class MemoryBackend {
 const tempRoot = await fs.mkdtemp(
 	path.join(os.tmpdir(), "pi-webdav-sync-test-"),
 );
+process.env.PI_WEBDAV_SYNC_DIR = path.join(tempRoot, "sync-state");
+
 const sourceAgent = path.join(tempRoot, "source-agent");
 const targetAgent = path.join(tempRoot, "target-agent");
 const externalDir = path.join(tempRoot, "external package");
@@ -110,7 +112,7 @@ try {
 	);
 	assert(!allPaths.includes("sessions/session"), "sessions should be excluded");
 	assert(
-		!allPaths.includes("webdav-sync/config"),
+		!allPaths.includes(".webdav-sync/config"),
 		"webdav-sync config should be excluded",
 	);
 	assert(!allPaths.includes("pi-crash.log"), "log files should be excluded");
@@ -172,7 +174,7 @@ try {
 	const badManifest = createManifest({
 		files: [
 			{
-				path: "webdav-sync/config.json",
+				path: ".webdav-sync/config.json",
 				type: "file",
 				size: 2,
 				sha256:
@@ -185,7 +187,7 @@ try {
 	});
 	const badZip = createLatestZip(
 		new Map([
-			["files/webdav-sync/config.json", Buffer.from("{}")],
+			["files/.webdav-sync/config.json", Buffer.from("{}")],
 			[
 				"manifest.json",
 				Buffer.from(`${JSON.stringify(badManifest, null, 2)}\n`, "utf8"),
@@ -323,7 +325,7 @@ try {
 	);
 
 	const backups = await fs.readdir(
-		path.join(targetAgent, "webdav-sync", "backups"),
+		path.join(tempRoot, "sync-state", "backups"),
 	);
 	assert.equal(backups.length, 1, "pull should create one local backup");
 	const restoreDryRun = await runWebdavSyncCommand(
@@ -362,7 +364,7 @@ async function seedSourceAgent(agentDir, externalDir) {
 	await fs.mkdir(path.join(agentDir, "npm", "pkg"), { recursive: true });
 	await fs.mkdir(path.join(agentDir, "git", "pkg"), { recursive: true });
 	await fs.mkdir(path.join(agentDir, "sessions"), { recursive: true });
-	await fs.mkdir(path.join(agentDir, "webdav-sync", "backups"), {
+	await fs.mkdir(path.join(agentDir, ".webdav-sync", "backups"), {
 		recursive: true,
 	});
 	await fs.mkdir(path.join(externalDir, "src"), { recursive: true });
@@ -397,7 +399,7 @@ async function seedSourceAgent(agentDir, externalDir) {
 		"bad\n",
 	);
 	await fs.writeFile(path.join(agentDir, "sessions", "session.json"), "bad\n");
-	await fs.writeFile(path.join(agentDir, "webdav-sync", "state.json"), "bad\n");
+	await fs.writeFile(path.join(agentDir, ".webdav-sync", "state.json"), "bad\n");
 	await fs.writeFile(path.join(agentDir, "pi-crash.log"), "bad\n");
 	await fs.writeFile(
 		path.join(externalDir, "package.json"),
