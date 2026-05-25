@@ -8,6 +8,7 @@ MVP Pi package for syncing selected `~/.pi/agent` files through a generic WebDAV
 npm install
 npm run typecheck
 npm test
+npm run release
 ```
 
 Install into Pi from this checkout, then reload Pi:

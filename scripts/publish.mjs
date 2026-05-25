@@ -1,0 +1,24 @@
+#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+process.chdir(root);
+
+run("npm", ["run", "typecheck"]);
+run("npm", ["test"]);
+run("npm", ["publish", "--access", "public"]);
+
+function run(command, args) {
+  const exe = process.platform === "win32" ? `${command}.cmd` : command;
+  const result = spawnSync(exe, args, { stdio: "inherit", shell: false });
+  if (result.error) throw result.error;
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+
+if (!existsSync("package.json")) {
+  console.error("package.json not found; script root resolution failed");
+  process.exit(1);
+}

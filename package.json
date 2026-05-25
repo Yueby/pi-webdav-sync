@@ -8,7 +8,8 @@
   "files": [
     "src/",
     "README.md",
-    "package.json"
+    "package.json",
+    "scripts/publish.mjs"
   ],
   "keywords": [
     "pi-package",
@@ -25,7 +26,8 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node scripts/self-test.mjs"
+    "test": "npm run build && node scripts/self-test.mjs",
+    "release": "node scripts/publish.mjs"
   },
   "dependencies": {
     "fflate": "^0.8.2",
