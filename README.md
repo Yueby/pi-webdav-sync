@@ -32,7 +32,7 @@ Backups and internal state live under hidden local state:
 ~/.pi/agent/.webdav-sync/backups/
 ```
 
-Supported fields include `remoteBaseUrl` (or init alias `url`), `username`, `passwordEnv`, `password` (less safe fallback), `remoteDir`, `installMissingPackages`, and `backupRetention`.
+Supported fields include `remoteBaseUrl`, `username`, `passwordEnv`, `password` (less safe fallback), `remoteDir`, `installMissingPackages`, and `backupRetention`.
 
 ### Jianguoyun / 坚果云 WebDAV example
 
@@ -54,13 +54,8 @@ The backend is generic WebDAV; 坚果云 is only an example.
 
 ## Commands
 
-- `/webdav-sync:push --dry-run` - preview local archive.
-- `/webdav-sync:push --yes` - upload `latest.zip`, `latest.json`, and one timestamped snapshot.
-- `/webdav-sync:pull --dry-run` - choose a remote snapshot and preview changes.
-- `/webdav-sync:pull --yes [--install-missing]` - choose a remote snapshot, backup local state, and apply it.
-- `/webdav-sync:pull --yes --snapshot=<id>` - skip TUI selection and pull a specific snapshot.
-
-`push` and `pull` require `--yes` unless using `--dry-run`.
+- `/webdav-sync:push` - upload `latest.zip`, `latest.json`, and one timestamped snapshot.
+- `/webdav-sync:pull` - choose a remote snapshot, backup local state, and apply it.
 
 ## What is collected
 
@@ -84,9 +79,9 @@ Always excluded at any depth:
 
 Pull restores external resources to `~/.pi/agent/external-resources/...` so the rewritten relative settings paths remain valid.
 
-## Backups and restore
+## Backups
 
-Before non-dry-run `pull`, the current local allowlist state is saved to:
+Before `pull`, the current local allowlist state is saved to:
 
 ```text
 ~/.pi/agent/.webdav-sync/backups/<timestamp>/backup.zip

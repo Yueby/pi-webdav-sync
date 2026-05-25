@@ -202,11 +202,11 @@ try {
 
 	await writeTestConfig(sourceAgent);
 	const backend = new MemoryBackend();
-	const push = await runWebdavSyncCommand(["push", "--yes", "--json"], {
+	const push = await runWebdavSyncCommand(["push"], {
 		agentDir: sourceAgent,
 		backend,
 	});
-	assert.equal(push.ok, true, "push --yes should upload to backend");
+	assert.equal(push.ok, true, "push should upload to backend");
 	const remoteKeys = [...backend.files.keys()].sort();
 	assert.equal(remoteKeys[0], "latest.json");
 	assert.equal(remoteKeys[1], "latest.zip");
@@ -216,7 +216,7 @@ try {
 	await seedTargetAgent(targetAgent);
 	await writeTestConfig(targetAgent);
 	let selectedSnapshot;
-	const dryPull = await runWebdavSyncCommand(["pull", "--dry-run", "--json"], {
+	const pull = await runWebdavSyncCommand(["pull"], {
 		agentDir: targetAgent,
 		backend,
 		selectSnapshot: async (choices) => {
@@ -224,22 +224,8 @@ try {
 			return selectedSnapshot;
 		},
 	});
-	assert.equal(dryPull.ok, true, "pull --dry-run should succeed");
-	assert(
-		(dryPull.data.diff.modify || []).includes("AGENTS.md"),
-		"dry-run should report changed AGENTS.md",
-	);
-	assert(
-		dryPull.data.diff.externalAdd.length > 0,
-		"dry-run should report external resource adds",
-	);
-
+	assert.equal(pull.ok, true, "pull should apply archive");
 	assert(selectedSnapshot?.startsWith("20"), "pull should expose snapshot choices");
-	const pull = await runWebdavSyncCommand(["pull", "--yes"], {
-		agentDir: targetAgent,
-		backend,
-	});
-	assert.equal(pull.ok, true, "pull --yes should apply archive");
 	assert.equal(
 		await fs.readFile(path.join(targetAgent, "AGENTS.md"), "utf8"),
 		"agent rules\n",

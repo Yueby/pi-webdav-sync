@@ -18,8 +18,8 @@ type PiLike = {
 };
 
 export function activate(pi: PiLike): void {
-	register(pi, "webdav-sync:push", "Push Pi config to WebDAV", "push");
-	register(pi, "webdav-sync:pull", "Pull Pi config from WebDAV", "pull");
+	register(pi, "webdav-sync:push", "Upload Pi config to WebDAV", "push");
+	register(pi, "webdav-sync:pull", "Download Pi config from WebDAV", "pull");
 }
 
 function register(pi: PiLike, name: string, description: string, command: "push" | "pull"): void {
