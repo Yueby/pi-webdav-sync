@@ -49,6 +49,7 @@ export class WebdavBackend implements SyncBackend {
 
 	async putBytes(remotePath: string, bytes: Uint8Array): Promise<void> {
 		await this.ensureRemoteDir();
+		await this.ensureRemoteParentDir(remotePath);
 		await this.client.putFileContents(
 			this.fullPath(remotePath),
 			Buffer.from(bytes),
@@ -78,9 +79,19 @@ export class WebdavBackend implements SyncBackend {
 	}
 
 	private async ensureRemoteDir(): Promise<void> {
-		if (this.remoteDir === "/") return;
+		await this.ensureDirectory(this.remoteDir);
+	}
+
+	private async ensureRemoteParentDir(remotePath: string): Promise<void> {
+		const parent = path.posix.dirname(safeRelativePath(remotePath));
+		if (!parent || parent === ".") return;
+		await this.ensureDirectory(toPosixPath(path.posix.join(this.remoteDir, parent)));
+	}
+
+	private async ensureDirectory(directoryPath: string): Promise<void> {
+		if (directoryPath === "/") return;
 		try {
-			await this.client.createDirectory(this.remoteDir, { recursive: true });
+			await this.client.createDirectory(directoryPath, { recursive: true });
 		} catch (error) {
 			const status = (error as WebDAVClientError).status;
 			if (status !== 405) throw error;
