@@ -18,7 +18,7 @@ export function configDir(agentDir = getAgentDir()): string {
 }
 
 export function configPath(agentDir = getAgentDir()): string {
-  return path.join(configDir(agentDir), "settings.json.webdav");
+  return path.join(configDir(agentDir), "settings.webdav.json");
 }
 
 export function stateDir(agentDir = getAgentDir()): string {

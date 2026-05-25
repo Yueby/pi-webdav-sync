@@ -33,7 +33,7 @@ Write minimal config with arguments:
 WebDAV config lives next to Pi's global settings file and is excluded from sync:
 
 ```text
-~/.pi/agent/settings.json.webdav
+~/.pi/agent/settings.webdav.json
 ```
 
 Backups and internal state live under hidden local state:
