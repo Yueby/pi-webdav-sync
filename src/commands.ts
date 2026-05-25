@@ -16,7 +16,7 @@ import {
 } from "./config.js";
 import { createLatestIndex, type LatestIndex, shortHash } from "./manifest.js";
 import { getAgentDir } from "./paths.js";
-import { missingInstallSpecs, redactPackageSpec } from "./package-specs.js";
+import { missingInstallSpecs } from "./package-specs.js";
 import {
 	createLatestZip,
 	parseArchive,
@@ -186,11 +186,10 @@ async function commandPush(
 	if (flags.has("--json")) return ok(JSON.stringify(result, null, 2), result);
 	return ok(
 		[
-			"Uploaded latest.zip and latest.json",
+			"push: ok",
 			`files: ${result.fileCount}`,
-			`externalResources: ${result.externalResourceCount}`,
-			`contentSha256: ${shortHash(result.contentSha256)}`,
-			`zipSha256: ${shortHash(result.zipSha256)}`,
+			`external: ${result.externalResourceCount}`,
+			`hash: ${shortHash(result.contentSha256)}`,
 		].join("\n"),
 		result,
 	);
@@ -229,20 +228,18 @@ async function commandPull(
 			: [];
 	const result = { backup, applied, packageSpecs: packages, installResults };
 	const lines = [
-		"Pulled and applied latest WebDAV archive",
+		"pull: ok",
 		`backup: ${backup.id}`,
-		`filesWritten: ${applied.filesWritten}`,
-		`externalFilesWritten: ${applied.externalFilesWritten}`,
-		`contentSha256: ${shortHash(archive.manifest.contentSha256)}`,
+		`files: ${applied.filesWritten}`,
+		`external: ${applied.externalFilesWritten}`,
+		`hash: ${shortHash(archive.manifest.contentSha256)}`,
 	];
 	if (packages.length && !installResults.length)
-		lines.push(
-			`Missing packages not installed. Run: ${packages.map((spec) => `pi install ${redactPackageSpec(spec)}`).join(" && ")}`,
-		);
-	for (const item of installResults)
-		lines.push(
-			`pi install ${redactPackageSpec(item.spec)}: ${item.ok ? "ok" : `failed (${item.code ?? "unknown"})`}`,
-		);
+		lines.push(`packages: ${packages.length} not installed; rerun with --install-missing`);
+	if (installResults.length) {
+		const failed = installResults.filter((item) => !item.ok).length;
+		lines.push(`packages: ${installResults.length - failed} installed, ${failed} failed`);
+	}
 	return ok(lines.join("\n"), result);
 }
 
@@ -270,9 +267,9 @@ async function commandRestore(
 	const applied = await applyArchiveToAgent(agentDir, archive);
 	return ok(
 		[
-			`Restored backup: ${record.id}`,
-			`filesWritten: ${applied.filesWritten}`,
-			`externalFilesWritten: ${applied.externalFilesWritten}`,
+			`restore: ${record.id}`,
+			`files: ${applied.filesWritten}`,
+			`external: ${applied.externalFilesWritten}`,
 		].join("\n"),
 		{ backup: record, applied },
 	);
@@ -313,21 +310,12 @@ function formatSummary(
 ): string {
 	const lines = [
 		title,
-		`agentDir: ${summary.agentDir}`,
 		`files: ${summary.fileCount}`,
-		`externalResources: ${summary.externalResourceCount}`,
-		`zipBytes: ${summary.zipBytes}`,
-		`contentSha256: ${summary.contentHash}`,
-		`zipSha256: ${summary.zipHash}`,
+		`external: ${summary.externalResourceCount}`,
+		`packages: ${summary.packageSpecs.length}`,
+		`hash: ${summary.contentHash}`,
 	];
-	if (summary.packageSpecs.length)
-		lines.push(
-			`packageSpecs: ${summary.packageSpecs.map(redactPackageSpec).join(", ")}`,
-		);
-	if (summary.warnings.length)
-		lines.push(
-			`warnings:\n${summary.warnings.map((warning) => `- ${warning}`).join("\n")}`,
-		);
+	if (summary.warnings.length) lines.push(`warnings: ${summary.warnings.length}`);
 	return lines.join("\n");
 }
 
@@ -337,22 +325,15 @@ function formatPullPlan(
 	diff: Awaited<ReturnType<typeof diffArchiveAgainstLocal>>,
 	packages: string[],
 ): string {
-	const lines = [
+	return [
 		title,
-		`remoteCreatedAt: ${latest.createdAt}`,
 		`files: ${latest.fileCount}`,
-		`externalResources: ${latest.externalResourceCount}`,
-		`contentSha256: ${shortHash(latest.contentSha256)}`,
-		`add: ${diff.add.length}`,
-		`modify: ${diff.modify.length}`,
-		`remove: ${diff.remove.length}`,
-		`externalAdd: ${diff.externalAdd.length}`,
-		`externalModify: ${diff.externalModify.length}`,
-		`externalRemove: ${diff.externalRemove.length}`,
-	];
-	if (packages.length)
-		lines.push(`packageSpecs: ${packages.map(redactPackageSpec).join(", ")}`);
-	return lines.join("\n");
+		`external: ${latest.externalResourceCount}`,
+		`changes: +${diff.add.length}/~${diff.modify.length}/-${diff.remove.length}`,
+		`externalChanges: +${diff.externalAdd.length}/~${diff.externalModify.length}/-${diff.externalRemove.length}`,
+		`packages: ${packages.length}`,
+		`hash: ${shortHash(latest.contentSha256)}`,
+	].join("\n");
 }
 
 async function readRemoteLatest(
@@ -371,11 +352,8 @@ function formatRemote(remote: unknown): string {
 	if (typeof remote === "object" && "empty" in remote) return "remote: empty";
 	const latest = remote as LatestIndex;
 	return [
-		`remoteCreatedAt: ${latest.createdAt}`,
-		`remoteFiles: ${latest.fileCount}`,
-		`remoteExternalResources: ${latest.externalResourceCount}`,
-		`remoteContentSha256: ${shortHash(latest.contentSha256)}`,
-		`remoteZipSha256: ${shortHash(latest.zipSha256)}`,
+		`remote: ${latest.fileCount} files, ${latest.externalResourceCount} external, ${latest.packageSpecs.length} packages`,
+		`remoteHash: ${shortHash(latest.contentSha256)}`,
 	].join("\n");
 }
 
@@ -479,15 +457,13 @@ function errorMessage(error: unknown): string {
 
 function helpText(): string {
 	return [
-		"Usage: /webdav-sync <command>",
-		"",
-		"Commands:",
-		"  init [key=value...]                 Show or write WebDAV config.",
-		"  status [--json]                    Compare local manifest with remote latest.json when configured.",
-		"  push --yes|--dry-run [--json]      Build latest.zip/latest.json and upload unless dry-run.",
-		"  pull --yes [--install-missing]     Download, verify, backup, and apply remote archive.",
-		"       [--dry-run]",
-		"  restore latest|<id> --yes|--dry-run Restore from local backup only.",
+		"/webdav-sync status",
+		"/webdav-sync push --dry-run",
+		"/webdav-sync push --yes",
+		"/webdav-sync pull --dry-run",
+		"/webdav-sync pull --yes [--install-missing]",
+		"/webdav-sync restore latest --yes",
+		"/webdav-sync init key=value...",
 	].join("\n");
 }
 
