@@ -12,8 +12,10 @@ run("npm", ["test"]);
 run("npm", ["publish", "--access", "public"]);
 
 function run(command, args) {
-  const exe = process.platform === "win32" ? `${command}.cmd` : command;
-  const result = spawnSync(exe, args, { stdio: "inherit", shell: false });
+  const result = spawnSync(command, args, {
+    stdio: "inherit",
+    shell: process.platform === "win32",
+  });
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
