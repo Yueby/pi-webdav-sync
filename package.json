@@ -1,6 +1,6 @@
 {
   "name": "pi-webdav-sync",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "description": "WebDAV backup and restore for Pi personal configuration.",
   "type": "module",
   "license": "MIT",
@@ -8,6 +8,7 @@
   "files": [
     "src/",
     "README.md",
+    "README.zh-CN.md",
     "package.json",
     "scripts/publish.mjs"
   ],

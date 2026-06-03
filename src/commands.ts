@@ -1,11 +1,19 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
 import {
 	createLocalBackup,
 	applyArchiveToAgent,
 	diffArchiveAgainstLocal,
 } from "./backup.js";
 import { collectAgentArchive } from "./collector.js";
-import { configPath, readConfig, type WebdavSyncConfig } from "./config.js";
+import {
+	configDir,
+	configPath,
+	readConfig,
+	validateConfig,
+	writeConfig,
+	type WebdavSyncConfig,
+} from "./config.js";
 import { createLatestIndex, type LatestIndex, shortHash } from "./manifest.js";
 import { getAgentDir } from "./paths.js";
 import { missingInstallSpecs } from "./package-specs.js";
@@ -27,9 +35,20 @@ export type CommandContext = {
 	agentDir?: string;
 	backend?: SyncBackend;
 	selectSnapshot?: (choices: SnapshotChoice[]) => Promise<string | undefined>;
+	confirmPush?: (preview: PushPreview) => Promise<boolean>;
+	confirmOverwriteConfig?: (path: string) => Promise<boolean>;
+	fetchRemoteConfig?: (url: string) => Promise<unknown>;
 	confirmInstallPackages?: (specs: string[]) => Promise<boolean>;
 	installPackage?: (spec: string) => Promise<number | null>;
 	onInstallProgress?: (progress: InstallProgress) => void;
+};
+
+export type PushPreview = {
+	fileCount: number;
+	externalResourceCount: number;
+	packageSpecs: string[];
+	hash: string;
+	warnings: string[];
 };
 
 export type InstallProgress = {
@@ -50,12 +69,14 @@ export async function runWebdavSyncCommand(
 	input: string | string[] = [],
 	context: CommandContext = {},
 ): Promise<CommandResult> {
-	const command = normalizeCommand(
-		Array.isArray(input) ? input[0] : splitArgs(input)[0],
-	);
+	const inputArgs = Array.isArray(input) ? input : splitArgs(input);
+	const command = normalizeCommand(inputArgs[0]);
+	const commandArgs = inputArgs.slice(1);
 	const agentDir = getAgentDir(context.agentDir);
 	try {
-		if (command === "push") return await commandPush(agentDir, context.backend);
+		if (command === "init")
+			return await commandInit(agentDir, context, commandArgs);
+		if (command === "push") return await commandPush(agentDir, context);
 		if (command === "pull") return await commandPull(agentDir, context);
 		return ok(helpText());
 	} catch (error) {
@@ -71,14 +92,67 @@ export async function handleWebdavSyncCommand(
 	return result.text;
 }
 
+async function commandInit(
+	agentDir: string,
+	context: CommandContext,
+	args: string[],
+): Promise<CommandResult> {
+	const target = configPath(agentDir);
+	const remoteUrl = args[0];
+	const exists = await fileExists(target);
+	if (exists) {
+		const overwrite = context.confirmOverwriteConfig
+			? await context.confirmOverwriteConfig(target)
+			: false;
+		if (!overwrite) return ok(["init: exists", `config: ${target}`].join("\n"));
+	}
+	if (remoteUrl) {
+		await writeRemoteConfigText(
+			agentDir,
+			await loadRemoteInitConfigText(remoteUrl, context),
+		);
+	} else {
+		await writeConfig(templateConfig(), agentDir);
+	}
+	return ok(
+		[
+			exists ? "init: overwritten" : "init: created",
+			`config: ${target}`,
+			remoteUrl ? "source: remote config" : "source: template",
+			remoteUrl
+				? "Review the config before push/pull."
+				: "Edit this file with your WebDAV credentials before push/pull.",
+		].join("\n"),
+	);
+}
+
 async function commandPush(
 	agentDir: string,
-	backendOverride?: SyncBackend,
+	context: CommandContext,
 ): Promise<CommandResult> {
 	const collected = await collectAgentArchive(agentDir);
 	const zip = createLatestZip(collected.zipEntries, collected.manifest);
+	const preview: PushPreview = {
+		fileCount: zip.latest.fileCount,
+		externalResourceCount: zip.latest.externalResourceCount,
+		packageSpecs: zip.latest.packageSpecs,
+		hash: shortHash(zip.latest.contentSha256),
+		warnings: collected.warnings,
+	};
+	if (context.confirmPush && !(await context.confirmPush(preview))) {
+		return ok(
+			[
+				"push: cancelled",
+				`files: ${preview.fileCount}`,
+				`external: ${preview.externalResourceCount}`,
+				`packages: ${preview.packageSpecs.length}`,
+				`hash: ${preview.hash}`,
+			].join("\n"),
+			preview,
+		);
+	}
 	const config = await requireConfig(agentDir);
-	const backend = backendOverride || createWebdavBackend(config);
+	const backend = context.backend || createWebdavBackend(config);
 	const snapshotId = snapshotIdFromDate(new Date(zip.latest.createdAt));
 	const snapshotZip = `snapshots/${snapshotId}.zip`;
 	const snapshotJson = `snapshots/${snapshotId}.json`;
@@ -275,6 +349,70 @@ async function installPackages(
 	return results;
 }
 
+function templateConfig(): WebdavSyncConfig {
+	return {
+		backend: "webdav",
+		remoteBaseUrl: "https://dav.example.com/dav/",
+		username: "your-email@example.com",
+		passwordEnv: "PI_WEBDAV_PASSWORD",
+		remoteDir: "/pi-agent-sync",
+		installMissingPackages: "ask",
+		backupRetention: 5,
+	};
+}
+
+async function loadRemoteInitConfigText(
+	url: string,
+	context: CommandContext,
+): Promise<string> {
+	if (!/^https?:\/\//i.test(url)) {
+		throw new Error(
+			"init remote config URL must start with http:// or https://",
+		);
+	}
+	const value = context.fetchRemoteConfig
+		? await context.fetchRemoteConfig(url)
+		: await fetchRemoteText(url);
+	return remoteConfigText(value);
+}
+
+async function fetchRemoteText(url: string): Promise<string> {
+	const response = await fetch(url);
+	if (!response.ok) {
+		throw new Error(`Failed to fetch remote config: HTTP ${response.status}`);
+	}
+	return response.text();
+}
+
+function remoteConfigText(value: unknown): string {
+	if (typeof value === "string") {
+		try {
+			return `${JSON.stringify(validateConfig(JSON.parse(value)), null, 2)}\n`;
+		} catch {
+			return value.endsWith("\n") ? value : `${value}\n`;
+		}
+	}
+	return `${JSON.stringify(validateConfig(value), null, 2)}\n`;
+}
+
+async function writeRemoteConfigText(
+	agentDir: string,
+	content: string,
+): Promise<void> {
+	await fs.mkdir(configDir(agentDir), { recursive: true });
+	await fs.writeFile(configPath(agentDir), content, "utf8");
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+	try {
+		await fs.access(filePath);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+}
+
 function runPiInstall(spec: string): Promise<number | null> {
 	return new Promise((resolve) => {
 		const child = spawn("pi", ["install", spec], {
@@ -286,8 +424,9 @@ function runPiInstall(spec: string): Promise<number | null> {
 	});
 }
 
-function normalizeCommand(raw?: string): "push" | "pull" | "help" {
+function normalizeCommand(raw?: string): "init" | "push" | "pull" | "help" {
 	const value = (raw || "").replace(/^webdav-sync:/, "").replace(/^:/, "");
+	if (value === "init") return "init";
 	if (value === "push") return "push";
 	if (value === "pull") return "pull";
 	return "help";
@@ -315,7 +454,9 @@ function fail(text: string): CommandResult {
 }
 
 function helpText(): string {
-	return ["/webdav-sync:push", "/webdav-sync:pull"].join("\n");
+	return ["/webdav-sync:init", "/webdav-sync:push", "/webdav-sync:pull"].join(
+		"\n",
+	);
 }
 
 function splitArgs(input: string): string[] {

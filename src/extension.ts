@@ -1,6 +1,7 @@
 import {
 	runWebdavSyncCommand,
 	type InstallProgress,
+	type PushPreview,
 	type SnapshotChoice,
 } from "./commands.js";
 
@@ -27,6 +28,12 @@ type PiLike = {
 };
 
 export function activate(pi: PiLike): void {
+	register(
+		pi,
+		"webdav-sync:init",
+		"Create WebDAV sync config template",
+		"init",
+	);
 	register(pi, "webdav-sync:push", "Upload Pi config to WebDAV", "push");
 	register(pi, "webdav-sync:pull", "Download Pi config from WebDAV", "pull");
 }
@@ -35,7 +42,7 @@ function register(
 	pi: PiLike,
 	name: string,
 	description: string,
-	command: "push" | "pull",
+	command: "init" | "push" | "pull",
 ): void {
 	pi.registerCommand?.(name, {
 		description,
@@ -46,6 +53,22 @@ function register(
 				ctx?.ui?.setStatus?.(statusKey, text);
 			try {
 				const result = await runWebdavSyncCommand(input, {
+					confirmPush:
+						command === "push" && ctx?.ui?.confirm
+							? async (preview: PushPreview) =>
+									ctx.ui?.confirm?.(
+										"Push Pi config to WebDAV?",
+										formatPushPreview(preview),
+									) ?? false
+							: undefined,
+					confirmOverwriteConfig:
+						command === "init" && ctx?.ui?.confirm
+							? async (path: string) =>
+									ctx.ui?.confirm?.(
+										"Overwrite WebDAV config?",
+										`Config already exists:\n${path}\n\nOverwrite it with the template?`,
+									) ?? false
+							: undefined,
 					selectSnapshot: ctx?.ui?.select
 						? async (choices: SnapshotChoice[]) => {
 								const labels = choices.map((choice) => choice.label);
@@ -76,6 +99,23 @@ function register(
 			}
 		},
 	});
+}
+
+function formatPushPreview(preview: PushPreview): string {
+	const lines = [
+		"This will overwrite latest.zip/latest.json and create a new snapshot.",
+		`Files: ${preview.fileCount}`,
+		`External resources: ${preview.externalResourceCount}`,
+		`Packages: ${preview.packageSpecs.length}`,
+		`Hash: ${preview.hash}`,
+	];
+	if (preview.warnings.length) {
+		lines.push("", "Warnings:", ...preview.warnings.slice(0, 5));
+		if (preview.warnings.length > 5) {
+			lines.push(`...and ${preview.warnings.length - 5} more warning(s)`);
+		}
+	}
+	return lines.join("\n");
 }
 
 function formatInstallProgress(progress: InstallProgress): string {

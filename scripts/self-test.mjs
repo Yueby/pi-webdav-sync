@@ -51,9 +51,134 @@ const tempRoot = await fs.mkdtemp(
 );
 const sourceAgent = path.join(tempRoot, "source-agent");
 const targetAgent = path.join(tempRoot, "target-agent");
+const initAgent = path.join(tempRoot, "init-agent");
 const externalDir = path.join(tempRoot, "external package");
 
 try {
+	const initCreated = await runWebdavSyncCommand(["init"], {
+		agentDir: initAgent,
+	});
+	assert.equal(initCreated.ok, true, "init should create config template");
+	const initConfigPath = path.join(initAgent, "settings.webdav.json");
+	const initConfig = JSON.parse(await fs.readFile(initConfigPath, "utf8"));
+	assert.equal(
+		initConfig.backend,
+		"webdav",
+		"init template should be WebDAV config",
+	);
+	assert.equal(
+		initConfig.passwordEnv,
+		"PI_WEBDAV_PASSWORD",
+		"init template should prefer passwordEnv",
+	);
+	const initExisting = await runWebdavSyncCommand(["init"], {
+		agentDir: initAgent,
+	});
+	assert.match(
+		initExisting.text,
+		/init: exists/,
+		"init should not overwrite existing config by default",
+	);
+	initConfig.remoteDir = "/custom";
+	await fs.writeFile(
+		initConfigPath,
+		`${JSON.stringify(initConfig, null, 2)}\n`,
+		"utf8",
+	);
+	let askedOverwritePath;
+	const initOverwrite = await runWebdavSyncCommand(["init"], {
+		agentDir: initAgent,
+		confirmOverwriteConfig: async (filePath) => {
+			askedOverwritePath = filePath;
+			return true;
+		},
+	});
+	assert.match(
+		initOverwrite.text,
+		/init: overwritten/,
+		"init should overwrite when confirmed",
+	);
+	assert.equal(
+		askedOverwritePath,
+		initConfigPath,
+		"init overwrite should expose config path",
+	);
+	assert.notEqual(
+		JSON.parse(await fs.readFile(initConfigPath, "utf8")).remoteDir,
+		"/custom",
+		"init overwrite should replace existing config",
+	);
+	const remoteInit = await runWebdavSyncCommand(
+		["init", "https://example.invalid/pi-webdav.json"],
+		{
+			agentDir: initAgent,
+			confirmOverwriteConfig: async () => true,
+			fetchRemoteConfig: async (url) => ({
+				backend: "webdav",
+				remoteBaseUrl: url.replace("pi-webdav.json", "dav/"),
+				username: "remote-user@example.com",
+				passwordEnv: "REMOTE_WEBDAV_PASSWORD",
+				remoteDir: "/remote-sync",
+				installMissingPackages: "never",
+				backupRetention: 3,
+			}),
+		},
+	);
+	assert.match(
+		remoteInit.text,
+		/source: remote config/,
+		"init should report remote config source",
+	);
+	const remoteConfig = JSON.parse(await fs.readFile(initConfigPath, "utf8"));
+	assert.equal(
+		remoteConfig.remoteBaseUrl,
+		"https://example.invalid/dav/",
+		"init remote URL should write fetched config",
+	);
+	assert.equal(
+		remoteConfig.passwordEnv,
+		"REMOTE_WEBDAV_PASSWORD",
+		"init remote URL should preserve fetched passwordEnv",
+	);
+	const remoteTextInit = await runWebdavSyncCommand(
+		["init", "https://example.invalid/plain-config.txt"],
+		{
+			agentDir: initAgent,
+			confirmOverwriteConfig: async () => true,
+			fetchRemoteConfig: async () =>
+				[
+					"{",
+					'  "backend": "webdav",',
+					'  "remoteBaseUrl": "https://plain.example/dav/",',
+					'  "username": "plain-user@example.com",',
+					'  "passwordEnv": "PLAIN_WEBDAV_PASSWORD",',
+					'  "remoteDir": "/plain-sync"',
+					"}",
+				].join("\n"),
+		},
+	);
+	assert.match(
+		remoteTextInit.text,
+		/source: remote config/,
+		"init should accept remote text config",
+	);
+	assert.equal(
+		JSON.parse(await fs.readFile(initConfigPath, "utf8")).remoteBaseUrl,
+		"https://plain.example/dav/",
+		"init remote text should write fetched text",
+	);
+	const badRemoteInit = await runWebdavSyncCommand(
+		["init", "file:///bad.json"],
+		{
+			agentDir: path.join(tempRoot, "bad-init-agent"),
+		},
+	);
+	assert.equal(
+		badRemoteInit.ok,
+		false,
+		"init should reject non-http remote config URLs",
+	);
+
 	await seedSourceAgent(sourceAgent, externalDir);
 
 	const collected = await collectAgentArchive(sourceAgent);
@@ -207,12 +332,35 @@ try {
 	);
 
 	await writeTestConfig(sourceAgent);
+	const cancelledBackend = new MemoryBackend();
+	let pushPreview;
+	const cancelledPush = await runWebdavSyncCommand(["push"], {
+		agentDir: sourceAgent,
+		backend: cancelledBackend,
+		confirmPush: async (preview) => {
+			pushPreview = preview;
+			return false;
+		},
+	});
+	assert.equal(cancelledPush.ok, true, "cancelled push should return cleanly");
+	assert.equal(
+		cancelledBackend.files.size,
+		0,
+		"cancelled push should not upload",
+	);
+	assert.equal(
+		pushPreview.fileCount,
+		zip.latest.fileCount,
+		"push confirmation should expose file count",
+	);
+
 	const backend = new MemoryBackend();
 	const push = await runWebdavSyncCommand(["push"], {
 		agentDir: sourceAgent,
 		backend,
+		confirmPush: async () => true,
 	});
-	assert.equal(push.ok, true, "push should upload to backend");
+	assert.equal(push.ok, true, "confirmed push should upload to backend");
 	const remoteKeys = [...backend.files.keys()].sort();
 	assert.equal(remoteKeys[0], "latest.json");
 	assert.equal(remoteKeys[1], "latest.zip");
