@@ -1,9 +1,17 @@
 {
   "name": "pi-webdav-sync",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "WebDAV backup and restore for Pi personal configuration.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yueby/pi-webdav-sync.git"
+  },
+  "homepage": "https://github.com/Yueby/pi-webdav-sync#readme",
+  "bugs": {
+    "url": "https://github.com/Yueby/pi-webdav-sync/issues"
+  },
   "main": "./src/extension.ts",
   "files": [
     "src/",

@@ -1,6 +1,11 @@
 # pi-webdav-sync
 
-[English README](./README.md) | [GitHub](https://github.com/Yueby/pi-webdav-sync)
+[English README](./README.md)
+
+[![npm version](https://img.shields.io/npm/v/pi-webdav-sync.svg)](https://www.npmjs.com/package/pi-webdav-sync)
+[![npm downloads](https://img.shields.io/npm/dm/pi-webdav-sync.svg)](https://www.npmjs.com/package/pi-webdav-sync)
+[![GitHub stars](https://img.shields.io/github/stars/Yueby/pi-webdav-sync.svg?style=flat)](https://github.com/Yueby/pi-webdav-sync/stargazers)
+[![license](https://img.shields.io/npm/l/pi-webdav-sync.svg)](./package.json)
 
 用于通过通用 WebDAV 服务同步 Pi `~/.pi/agent` 中选定配置文件的 Pi package。它会在远端保存 `latest.zip`、`latest.json`，并在 `snapshots/` 下保存带时间戳的快照。
 

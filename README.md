@@ -1,6 +1,11 @@
 # pi-webdav-sync
 
-[中文说明](./README.zh-CN.md) | [GitHub](https://github.com/Yueby/pi-webdav-sync)
+[中文说明](./README.zh-CN.md)
+
+[![npm version](https://img.shields.io/npm/v/pi-webdav-sync.svg)](https://www.npmjs.com/package/pi-webdav-sync)
+[![npm downloads](https://img.shields.io/npm/dm/pi-webdav-sync.svg)](https://www.npmjs.com/package/pi-webdav-sync)
+[![GitHub stars](https://img.shields.io/github/stars/Yueby/pi-webdav-sync.svg?style=flat)](https://github.com/Yueby/pi-webdav-sync/stargazers)
+[![license](https://img.shields.io/npm/l/pi-webdav-sync.svg)](./package.json)
 
 Pi package for syncing selected `~/.pi/agent` files through a generic WebDAV server. It stores `latest.zip`, `latest.json`, and timestamped snapshots under `snapshots/`.
 

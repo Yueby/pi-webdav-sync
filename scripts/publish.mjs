@@ -16,6 +16,7 @@ if (!existsSync("package.json")) {
 
 run("npm", ["run", "typecheck"]);
 run("npm", ["test"]);
+ensureNpmLogin();
 run("npm", [
 	"publish",
 	"--access",
@@ -26,11 +27,24 @@ run("npm", [
 	"web",
 ]);
 
-function run(command, args) {
+function ensureNpmLogin() {
+	const whoami = run("npm", ["whoami", "--registry", registry], {
+		exitOnError: false,
+	});
+	if (whoami.status === 0) return;
+
+	console.log("\nNot logged in to npm. Starting web login...");
+	run("npm", ["login", "--registry", registry, "--auth-type", "web"]);
+}
+
+function run(command, args, options = {}) {
 	const result = spawnSync(command, args, {
 		stdio: "inherit",
 		shell: process.platform === "win32",
 	});
 	if (result.error) throw result.error;
-	if (result.status !== 0) process.exit(result.status ?? 1);
+	if (result.status !== 0 && options.exitOnError !== false) {
+		process.exit(result.status ?? 1);
+	}
+	return result;
 }
