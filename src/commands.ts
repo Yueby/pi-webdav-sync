@@ -130,7 +130,8 @@ async function commandPush(
 	agentDir: string,
 	context: CommandContext,
 ): Promise<CommandResult> {
-	const collected = await collectAgentArchive(agentDir);
+	const config = await requireConfig(agentDir);
+	const collected = await collectAgentArchive(agentDir, config);
 	const zip = createLatestZip(collected.zipEntries, collected.manifest);
 	const preview: PushPreview = {
 		fileCount: zip.latest.fileCount,
@@ -151,7 +152,6 @@ async function commandPush(
 			preview,
 		);
 	}
-	const config = await requireConfig(agentDir);
 	const backend = context.backend || createWebdavBackend(config);
 	const snapshotId = snapshotIdFromDate(new Date(zip.latest.createdAt));
 	const snapshotZip = `snapshots/${snapshotId}.zip`;
@@ -185,12 +185,16 @@ async function commandPull(
 	const snapshot = await chooseSnapshot(backend, context.selectSnapshot);
 	const latest = await backend.getJson<LatestIndex>(snapshot.jsonPath);
 	const zipBytes = await backend.getBytes(snapshot.zipPath);
-	const archive = parseArchive(zipBytes, latest.zipSha256);
+	const archive = parseArchive(zipBytes, latest.zipSha256, config);
 	validateLatestMatchesManifest(latest, archive);
-	const diff = await diffArchiveAgainstLocal(agentDir, archive);
+	const diff = await diffArchiveAgainstLocal(agentDir, archive, config);
 	const packages = missingInstallSpecs(await settingsJsonFromArchive(archive));
-	const backup = await createLocalBackup(agentDir, config.backupRetention ?? 5);
-	const applied = await applyArchiveToAgent(agentDir, archive);
+	const backup = await createLocalBackup(
+		agentDir,
+		config.backupRetention ?? 5,
+		config,
+	);
+	const applied = await applyArchiveToAgent(agentDir, archive, config);
 	const shouldInstall = await shouldInstallPackages(
 		packages,
 		config,
@@ -358,6 +362,8 @@ function templateConfig(): WebdavSyncConfig {
 		remoteDir: "/pi-agent-sync",
 		installMissingPackages: "ask",
 		backupRetention: 5,
+		extraFiles: [],
+		extraDirs: [],
 	};
 }
 

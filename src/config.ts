@@ -1,6 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getAgentDir } from "./paths.js";
+import {
+  getAgentDir,
+  isExcludedRelativePath,
+  normalizeConfiguredPath,
+  validatePathForCurrentPlatform,
+} from "./paths.js";
 
 export type WebdavSyncConfig = {
   backend: "webdav";
@@ -11,6 +16,8 @@ export type WebdavSyncConfig = {
   remoteDir?: string;
   installMissingPackages?: "ask" | "always" | "never";
   backupRetention?: number;
+  extraFiles?: string[];
+  extraDirs?: string[];
 };
 
 export function configDir(agentDir = getAgentDir()): string {
@@ -65,5 +72,45 @@ export function validateConfig(value: unknown): WebdavSyncConfig {
   if (config.backupRetention !== undefined && (!Number.isInteger(config.backupRetention) || config.backupRetention < 0)) {
     throw new Error("backupRetention must be a non-negative integer");
   }
+  config.extraFiles = validateConfiguredPaths(input.extraFiles, "extraFiles");
+  config.extraDirs = validateConfiguredPaths(input.extraDirs, "extraDirs");
+  for (const file of config.extraFiles || []) {
+    const fileKey = configuredPathComparisonKey(file);
+    for (const dir of config.extraDirs || []) {
+      const dirKey = configuredPathComparisonKey(dir);
+      if (dirKey === fileKey || dirKey.startsWith(`${fileKey}/`)) {
+        throw new Error(`extra file conflicts with extra directory: ${file}, ${dir}`);
+      }
+    }
+  }
   return config;
+}
+
+function validateConfiguredPaths(value: unknown, key: "extraFiles" | "extraDirs"): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error(`${key} must be an array of strings`);
+  const normalized = value.map((item, index) => {
+    if (typeof item !== "string") throw new Error(`${key}[${index}] must be a string`);
+    let configuredPath: string;
+    try {
+      configuredPath = normalizeConfiguredPath(item);
+    } catch {
+      throw new Error(`${key}[${index}] must be agent-relative or start with ~/`);
+    }
+    try {
+      validatePathForCurrentPlatform(configuredPath);
+    } catch {
+      throw new Error(`${key}[${index}] is not valid on this platform`);
+    }
+    if (isExcludedRelativePath(configuredPath, key === "extraDirs")) {
+      throw new Error(`${key}[${index}] is always excluded from sync`);
+    }
+    return configuredPath;
+  });
+  return [...new Set(normalized)];
+}
+
+function configuredPathComparisonKey(value: string): string {
+  if (process.platform === "darwin") return value.normalize("NFD").toLowerCase();
+  return process.platform === "win32" ? value.toLowerCase() : value;
 }
