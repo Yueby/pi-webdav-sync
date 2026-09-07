@@ -926,6 +926,27 @@ try {
 		"restore should add one safety backup",
 	);
 
+	const backupIds = (
+		await fs.readdir(path.join(targetAgent, ".webdav-sync", "backups"))
+	).sort();
+	const restoreExplicit = await runWebdavSyncCommand(
+		["restore", backupIds[0]],
+		{
+			agentDir: targetAgent,
+			confirmRestore: async () => true,
+		},
+	);
+	assert.equal(
+		restoreExplicit.ok,
+		true,
+		"restore should accept an explicit backup id",
+	);
+	assert.match(
+		restoreExplicit.text,
+		new RegExp(`restore: ${backupIds[0]}`),
+		"explicit restore should report the requested backup id",
+	);
+
 	const configPath = path.join(targetAgent, "settings.webdav.json");
 	const originalConfig = await fs.readFile(configPath, "utf8");
 	const plaintextConfig = JSON.parse(originalConfig);
