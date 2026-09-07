@@ -66,6 +66,15 @@ export class WebdavBackend implements SyncBackend {
 		await this.client.copyFile(this.fullPath(fromPath), this.fullPath(toPath));
 	}
 
+	async delete(remotePath: string): Promise<void> {
+		try {
+			await this.client.deleteFile(this.fullPath(remotePath));
+		} catch (error) {
+			const status = (error as WebDAVClientError).status;
+			if (status !== 404) throw error;
+		}
+	}
+
 	async list(remotePath = "."): Promise<RemoteListEntry[]> {
 		const items = await this.client.getDirectoryContents(
 			this.fullPath(remotePath),

@@ -56,7 +56,7 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
 ~/.pi/agent/.webdav-sync/backups/
 ```
 
-支持字段包括 `remoteBaseUrl`、`username`、`passwordEnv`、`password`（不太安全的兜底方式）、`remoteDir`、`installMissingPackages`、`backupRetention`、`extraFiles` 和 `extraDirs`。
+支持字段包括 `remoteBaseUrl`、`username`、`passwordEnv`、`password`（不太安全的兜底方式）、`remoteDir`、`installMissingPackages`、`backupRetention`、`snapshotRetention`、`extraFiles` 和 `extraDirs`。
 
 ### 坚果云 WebDAV 示例
 
@@ -81,7 +81,7 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
 ## 命令
 
 - `/webdav-sync:init [https-url]` - 从模板或远程配置文本创建 `settings.webdav.json`，覆盖前会询问。
-- `/webdav-sync:push` - 显示摘要并询问确认，然后上传 `latest.zip`、`latest.json` 和一个时间戳快照。取消后不会上传任何内容。
+- `/webdav-sync:push` - 显示摘要并询问确认，然后上传 `latest.zip`、`latest.json` 和一个时间戳快照。push 会清理超出 `snapshotRetention`（默认 5）的远端旧快照，只保留最新的。取消后不会上传任何内容。
 - `/webdav-sync:pull` - 选择远程快照，备份本地状态，应用远程配置，并可选择安装快照中的 package specs。
 
 当 `installMissingPackages` 为：

@@ -164,16 +164,25 @@ async function commandPush(
 		snapshotId,
 		zip: snapshotZip,
 	});
-	return ok(
-		[
-			"push: ok",
-			`files: ${zip.latest.fileCount}`,
-			`external: ${zip.latest.externalResourceCount}`,
-			`packages: ${zip.latest.packageSpecs.length}`,
-			`hash: ${shortHash(zip.latest.contentSha256)}`,
-		].join("\n"),
-		zip.latest,
-	);
+	const lines = [
+		"push: ok",
+		`files: ${zip.latest.fileCount}`,
+		`external: ${zip.latest.externalResourceCount}`,
+		`packages: ${zip.latest.packageSpecs.length}`,
+		`hash: ${shortHash(zip.latest.contentSha256)}`,
+	];
+	try {
+		const pruned = await pruneRemoteSnapshots(
+			backend,
+			config.snapshotRetention ?? 5,
+		);
+		if (pruned.length) lines.push(`pruned: ${pruned.length} old snapshot(s)`);
+	} catch (error) {
+		lines.push(
+			`snapshot prune failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	return ok(lines.join("\n"), zip.latest);
 }
 
 async function commandPull(
@@ -229,6 +238,28 @@ async function commandPull(
 		applied,
 		packages,
 	});
+}
+
+export async function pruneRemoteSnapshots(
+	backend: SyncBackend,
+	retention: number,
+): Promise<string[]> {
+	if (!Number.isInteger(retention) || retention < 0) return [];
+	const entries = await backend.list("snapshots");
+	const ids: string[] = [];
+	for (const entry of entries) {
+		const name = entry.path.split(/[\\/]/).pop() || entry.path;
+		if (entry.type !== "file" || !name.endsWith(".zip")) continue;
+		ids.push(name.slice(0, -4));
+	}
+	ids.sort((a, b) => b.localeCompare(a));
+	const pruned: string[] = [];
+	for (const id of ids.slice(retention)) {
+		await backend.delete(`snapshots/${id}.zip`);
+		await backend.delete(`snapshots/${id}.json`);
+		pruned.push(id);
+	}
+	return pruned;
 }
 
 async function chooseSnapshot(
@@ -362,6 +393,7 @@ function templateConfig(): WebdavSyncConfig {
 		remoteDir: "/pi-agent-sync",
 		installMissingPackages: "ask",
 		backupRetention: 5,
+		snapshotRetention: 5,
 		extraFiles: [],
 		extraDirs: [],
 	};

@@ -56,7 +56,7 @@ Backups and internal state live under hidden local state:
 ~/.pi/agent/.webdav-sync/backups/
 ```
 
-Supported fields include `remoteBaseUrl`, `username`, `passwordEnv`, `password` (less safe fallback), `remoteDir`, `installMissingPackages`, `backupRetention`, `extraFiles`, and `extraDirs`.
+Supported fields include `remoteBaseUrl`, `username`, `passwordEnv`, `password` (less safe fallback), `remoteDir`, `installMissingPackages`, `backupRetention`, `snapshotRetention`, `extraFiles`, and `extraDirs`.
 
 ### Jianguoyun / 坚果云 WebDAV example
 
@@ -81,7 +81,7 @@ Using `passwordEnv` is recommended. Set `PI_WEBDAV_PASSWORD` locally instead of 
 ## Commands
 
 - `/webdav-sync:init [https-url]` - create `settings.webdav.json` from a template or remote config text, asking before overwrite.
-- `/webdav-sync:push` - show a summary and ask for confirmation, then upload `latest.zip`, `latest.json`, and one timestamped snapshot. Cancelling does not upload anything.
+- `/webdav-sync:push` - show a summary and ask for confirmation, then upload `latest.zip`, `latest.json`, and one timestamped snapshot. Push prunes remote snapshots beyond `snapshotRetention` (default 5), keeping the newest ones. Cancelling does not upload anything.
 - `/webdav-sync:pull` - choose a remote snapshot, back up local state, apply it, and optionally install package specs found in the snapshot.
 
 When `installMissingPackages` is:

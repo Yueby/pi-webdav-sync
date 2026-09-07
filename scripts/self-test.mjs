@@ -15,7 +15,9 @@ const { isRemotePackageSpec } = await import(distUrl("package-specs.js"));
 const { createLatestZip, listZipEntries, parseArchive } = await import(
 	distUrl("zip-store.js")
 );
-const { runWebdavSyncCommand } = await import(distUrl("commands.js"));
+const { runWebdavSyncCommand, pruneRemoteSnapshots } = await import(
+	distUrl("commands.js")
+);
 const { loadBackup, applyArchiveToAgent } = await import(distUrl("backup.js"));
 
 class MemoryBackend {
@@ -37,6 +39,9 @@ class MemoryBackend {
 	}
 	async putBytes(remotePath, bytes) {
 		this.files.set(remotePath, Buffer.from(bytes));
+	}
+	async delete(remotePath) {
+		this.files.delete(remotePath);
 	}
 	async exists(remotePath) {
 		return this.files.has(remotePath);
@@ -694,6 +699,55 @@ try {
 			(key) => key.startsWith("snapshots/") && key.endsWith(".zip"),
 		).length,
 		1,
+	);
+
+	const pruneBackend = new MemoryBackend();
+	const fakeIds = [
+		"2026-01-01T00-00-00-000Z",
+		"2026-01-02T00-00-00-000Z",
+		"2026-01-03T00-00-00-000Z",
+		"2026-01-04T00-00-00-000Z",
+		"2026-01-05T00-00-00-000Z",
+		"2026-01-06T00-00-00-000Z",
+		"2026-01-07T00-00-00-000Z",
+		"2026-01-08T00-00-00-000Z",
+	];
+	for (const id of fakeIds) {
+		pruneBackend.files.set(`snapshots/${id}.zip`, Buffer.from("zip"));
+		pruneBackend.files.set(`snapshots/${id}.json`, Buffer.from("{}"));
+	}
+	const pruned = await pruneRemoteSnapshots(pruneBackend, 5);
+	assert.deepEqual(
+		pruned.sort(),
+		fakeIds.slice(0, 3),
+		"prune should drop oldest beyond retention",
+	);
+	assert.equal(
+		[...pruneBackend.files.keys()].filter(
+			(key) => key.startsWith("snapshots/") && key.endsWith(".zip"),
+		).length,
+		5,
+		"retention should keep newest 5 snapshots",
+	);
+	assert.equal(
+		pruneBackend.files.has("snapshots/2026-01-08T00-00-00-000Z.zip"),
+		true,
+		"newest snapshot should survive pruning",
+	);
+	assert.equal(
+		pruneBackend.files.has("snapshots/2026-01-01T00-00-00-000Z.json"),
+		false,
+		"pruned snapshot json should be removed",
+	);
+	assert.equal(
+		(await pruneRemoteSnapshots(pruneBackend, 0)).length,
+		5,
+		"retention 0 should prune everything",
+	);
+	assert.equal(
+		pruneBackend.files.size,
+		0,
+		"retention 0 should leave no snapshots",
 	);
 
 	await seedTargetAgent(targetAgent);

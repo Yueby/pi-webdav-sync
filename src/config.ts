@@ -16,6 +16,7 @@ export type WebdavSyncConfig = {
   remoteDir?: string;
   installMissingPackages?: "ask" | "always" | "never";
   backupRetention?: number;
+  snapshotRetention?: number;
   extraFiles?: string[];
   extraDirs?: string[];
 };
@@ -38,6 +39,7 @@ export function defaultConfig(): WebdavSyncConfig {
     remoteDir: "/",
     installMissingPackages: "ask",
     backupRetention: 5,
+    snapshotRetention: 5,
   };
 }
 
@@ -71,6 +73,9 @@ export function validateConfig(value: unknown): WebdavSyncConfig {
   }
   if (config.backupRetention !== undefined && (!Number.isInteger(config.backupRetention) || config.backupRetention < 0)) {
     throw new Error("backupRetention must be a non-negative integer");
+  }
+  if (config.snapshotRetention !== undefined && (!Number.isInteger(config.snapshotRetention) || config.snapshotRetention < 0)) {
+    throw new Error("snapshotRetention must be a non-negative integer");
   }
   config.extraFiles = validateConfiguredPaths(input.extraFiles, "extraFiles");
   config.extraDirs = validateConfiguredPaths(input.extraDirs, "extraDirs");
