@@ -56,7 +56,7 @@ Backups and internal state live under hidden local state:
 ~/.pi/agent/.webdav-sync/backups/
 ```
 
-Supported fields include `remoteBaseUrl`, `username`, `passwordEnv`, `password` (less safe fallback), `remoteDir`, `installMissingPackages`, and `backupRetention`.
+Supported fields include `remoteBaseUrl`, `username`, `passwordEnv`, `password` (less safe fallback), `remoteDir`, `installMissingPackages`, `backupRetention`, `extraFiles`, and `extraDirs`.
 
 ### Jianguoyun / 坚果云 WebDAV example
 
@@ -70,7 +70,9 @@ Create an application password in 坚果云, then write:
   "passwordEnv": "PI_WEBDAV_PASSWORD",
   "remoteDir": "/pi-agent-sync",
   "installMissingPackages": "ask",
-  "backupRetention": 5
+  "backupRetention": 5,
+  "extraFiles": ["~/.pi/web-search.json", "hermes-memory-config.json"],
+  "extraDirs": ["~/.config/rpiv-ask-user-question"]
 }
 ```
 
@@ -98,6 +100,10 @@ Allowlist directories:
 
 - `prompts/`, `skills/`, `extensions/`, `themes/`
 
+Additional files and directories can be opted into with `extraFiles` and `extraDirs`. Relative paths resolve from the agent directory; paths beginning with `~/` resolve from the current user's home directory. Absolute paths, bare `~`, and paths that escape through `..` are rejected. Missing configured paths are skipped with a warning.
+
+A pull accepts a non-builtin manifest path only when the receiving machine's local `settings.webdav.json` authorizes the same file or a containing extra directory. This means every machine must opt into the paths it is willing to restore. Pull replaces configured extra files and directories just like the built-in allowlist, so keep `extraDirs` narrowly scoped.
+
 Always excluded at any depth:
 
 - `npm/`, `git/`, `node_modules/`, `sessions/`, `cache/`, `logs/`, `webdav-sync/`, `.webdav-sync/`, `.git/`
@@ -119,7 +125,7 @@ Pull restores external resources to `~/.pi/agent/external-resources/...` so the 
 
 ## Backups
 
-Before `pull`, the current local allowlist state is saved to:
+Before `pull`, the current local built-in and configured extra paths are saved to:
 
 ```text
 ~/.pi/agent/.webdav-sync/backups/<timestamp>/backup.zip
@@ -131,4 +137,4 @@ Backups are local safety copies. There is no public restore command; use the lat
 
 This package has no client-side encryption. Secret-bearing allowlist files such as `auth.json`, `models.json`, and `mcp.json` can be included in `latest.zip`; the WebDAV service can see zip contents. Command output prints paths, counts, sizes, and hash prefixes only, not file contents or password values.
 
-Path safety checks reject unsafe zip entries (`..`, absolute paths, Windows drive paths, backslashes, and duplicate entries). Restore writes only under the agent directory and only from manifest-validated archive entries.
+Path safety checks reject unsafe zip entries (`..`, absolute paths, Windows drive paths, backslashes, and duplicate entries). Restore writes only to the agent directory, explicitly configured `~/` targets, and manifest-validated external resources. A custom manifest path is rejected unless it is also authorized by the receiving machine's local config.

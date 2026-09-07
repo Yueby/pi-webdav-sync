@@ -56,7 +56,7 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
 ~/.pi/agent/.webdav-sync/backups/
 ```
 
-支持字段包括 `remoteBaseUrl`、`username`、`passwordEnv`、`password`（不太安全的兜底方式）、`remoteDir`、`installMissingPackages` 和 `backupRetention`。
+支持字段包括 `remoteBaseUrl`、`username`、`passwordEnv`、`password`（不太安全的兜底方式）、`remoteDir`、`installMissingPackages`、`backupRetention`、`extraFiles` 和 `extraDirs`。
 
 ### 坚果云 WebDAV 示例
 
@@ -70,7 +70,9 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
   "passwordEnv": "PI_WEBDAV_PASSWORD",
   "remoteDir": "/pi-agent-sync",
   "installMissingPackages": "ask",
-  "backupRetention": 5
+  "backupRetention": 5,
+  "extraFiles": ["~/.pi/web-search.json", "hermes-memory-config.json"],
+  "extraDirs": ["~/.config/rpiv-ask-user-question"]
 }
 ```
 
@@ -98,6 +100,10 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
 
 - `prompts/`、`skills/`、`extensions/`、`themes/`
 
+可以通过 `extraFiles` 和 `extraDirs` 额外加入文件和目录。相对路径从 agent 目录解析，以 `~/` 开头的路径从当前用户的 home 目录解析。绝对路径、单独的 `~` 和通过 `..` 跳出基准目录的路径会被拒绝；不存在的配置路径会跳过并产生 warning。
+
+pull 只会接受接收机器本地 `settings.webdav.json` 已授权的非内置 manifest 路径：路径必须与某个额外文件完全一致，或位于某个额外目录之下。因此每台机器都要明确配置愿意恢复的路径。pull 会像处理内置 allowlist 一样替换额外文件和目录，请让 `extraDirs` 保持足够精确。
+
 任意层级都会排除：
 
 - `npm/`、`git/`、`node_modules/`、`sessions/`、`cache/`、`logs/`、`webdav-sync/`、`.webdav-sync/`、`.git/`
@@ -119,7 +125,7 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
 
 ## 备份
 
-`pull` 前会把当前本地 allowlist 状态保存到：
+`pull` 前会把当前本地内置 allowlist 和已配置的额外路径保存到：
 
 ```text
 ~/.pi/agent/.webdav-sync/backups/<timestamp>/backup.zip
@@ -131,4 +137,4 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
 
 这个 package 没有客户端加密。`auth.json`、`models.json`、`mcp.json` 等可能包含密钥的 allowlist 文件会被包含进 `latest.zip`；WebDAV 服务可以看到 zip 内容。命令输出只打印路径、数量、大小和哈希前缀，不打印文件内容或密码值。
 
-路径安全检查会拒绝不安全 zip 条目（`..`、绝对路径、Windows 盘符路径、反斜杠、重复条目）。恢复时只会写入 agent 目录下，并且只恢复 manifest 校验过的归档条目。
+路径安全检查会拒绝不安全 zip 条目（`..`、绝对路径、Windows 盘符路径、反斜杠、重复条目）。恢复时只会写入 agent 目录、明确配置的 `~/` 目标和经过 manifest 校验的外部资源；接收机器本地配置未授权的自定义 manifest 路径会被拒绝。

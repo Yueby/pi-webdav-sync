@@ -3,12 +3,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { zipSync } from "fflate";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const distUrl = (relativePath) =>
 	pathToFileURL(path.join(root, "dist/src", relativePath)).href;
 const { collectAgentArchive } = await import(distUrl("collector.js"));
-const { createManifest } = await import(distUrl("manifest.js"));
+const { validateConfig } = await import(distUrl("config.js"));
+const { createManifest, sha256Bytes } = await import(distUrl("manifest.js"));
 const { isRemotePackageSpec } = await import(distUrl("package-specs.js"));
 const { createLatestZip, listZipEntries, parseArchive } = await import(
 	distUrl("zip-store.js")
@@ -49,10 +51,19 @@ class MemoryBackend {
 const tempRoot = await fs.mkdtemp(
 	path.join(os.tmpdir(), "pi-webdav-sync-test-"),
 );
+const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
+const testHome = path.join(tempRoot, "home");
+process.env.HOME = testHome;
+process.env.USERPROFILE = testHome;
 const sourceAgent = path.join(tempRoot, "source-agent");
 const targetAgent = path.join(tempRoot, "target-agent");
 const initAgent = path.join(tempRoot, "init-agent");
 const externalDir = path.join(tempRoot, "external package");
+const extraPaths = {
+	extraFiles: ["hermes-memory-config.json", "~/.pi/web-search.json"],
+	extraDirs: ["custom-config"],
+};
 
 try {
 	const initCreated = await runWebdavSyncCommand(["init"], {
@@ -71,6 +82,86 @@ try {
 		"PI_WEBDAV_PASSWORD",
 		"init template should prefer passwordEnv",
 	);
+	assert.deepEqual(initConfig.extraFiles, [], "init template should include extraFiles");
+	assert.deepEqual(initConfig.extraDirs, [], "init template should include extraDirs");
+	assert.deepEqual(
+		validateConfig({
+			backend: "webdav",
+			extraFiles: ["foo\\bar.json", "foo/bar.json"],
+			extraDirs: ["~\\.config\\tool"],
+		}).extraFiles,
+		["foo/bar.json"],
+		"configured paths should be normalized and deduplicated",
+	);
+	assert.deepEqual(
+		validateConfig({
+			backend: "webdav",
+			extraDirs: ["~\\.config\\tool"],
+		}).extraDirs,
+		["~/.config/tool"],
+		"home-relative configured paths should use portable separators",
+	);
+	assert.throws(
+		() => validateConfig({ backend: "webdav", extraFiles: "file.json" }),
+		/array of strings/,
+		"extraFiles should require an array",
+	);
+	assert.throws(
+		() => validateConfig({ backend: "webdav", extraFiles: ["../file.json"] }),
+		/agent-relative or start with ~\//,
+		"configured paths should reject traversal",
+	);
+	assert.throws(
+		() => validateConfig({ backend: "webdav", extraFiles: ["C:\\file.json"] }),
+		/agent-relative or start with ~\//,
+		"configured paths should reject absolute paths",
+	);
+	assert.throws(
+		() => validateConfig({ backend: "webdav", extraFiles: ["C:relative.json"] }),
+		/agent-relative or start with ~\//,
+		"configured paths should reject drive-relative paths",
+	);
+	assert.throws(
+		() => validateConfig({ backend: "webdav", extraFiles: ["bad\0file.json"] }),
+		/agent-relative or start with ~\//,
+		"configured paths should reject NUL on every platform",
+	);
+	assert.throws(
+		() =>
+			validateConfig({
+				backend: "webdav",
+				extraFiles: ["custom"],
+				extraDirs: ["custom/nested"],
+			}),
+		/conflicts with extra directory/,
+		"an extra file should not contain an extra directory",
+	);
+	assert.throws(
+		() => validateConfig({ backend: "webdav", extraDirs: ["cache"] }),
+		/always excluded/,
+		"configured paths should reject always-excluded directories",
+	);
+	if (process.platform === "win32") {
+		for (const invalidPath of ["bad?.json", "file.txt:hidden", "CON.json"]) {
+			assert.throws(
+				() => validateConfig({ backend: "webdav", extraFiles: [invalidPath] }),
+				/not valid on this platform/,
+				`configured path should reject Windows-invalid name: ${invalidPath}`,
+			);
+		}
+	}
+	if (process.platform === "win32" || process.platform === "darwin") {
+		assert.throws(
+			() =>
+				validateConfig({
+					backend: "webdav",
+					extraFiles: ["Custom"],
+					extraDirs: ["custom/nested"],
+				}),
+			/conflicts with extra directory/,
+			"configured paths should detect case-insensitive type conflicts",
+		);
+	}
 	const initExisting = await runWebdavSyncCommand(["init"], {
 		agentDir: initAgent,
 	});
@@ -220,6 +311,14 @@ try {
 		manifestPaths.includes("extensions/foo/index.js"),
 		"allowlist extension file should enter manifest",
 	);
+	assert(
+		!manifestPaths.includes("hermes-memory-config.json"),
+		"unconfigured extra file should stay out of manifest",
+	);
+	assert(
+		!manifestPaths.includes("custom-config/nested/config.json"),
+		"unconfigured extra directory should stay out of manifest",
+	);
 
 	const allPaths = [...manifestPaths, ...zipEntries].join("\n");
 	assert(
@@ -330,6 +429,226 @@ try {
 		/not allowlisted/,
 		"manifest paths outside allowlist should be rejected",
 	);
+	const nulZip = createUncheckedRegularFileZip([
+		["custom-config/bad\0file.json", Buffer.from("unsafe\n")],
+	]);
+	assert.throws(
+		() => parseArchive(nulZip, undefined, { extraDirs: ["custom-config"] }),
+		/Unsafe zip path/,
+		"incoming archives should reject NUL paths on every platform",
+	);
+
+	const homeExtraPath = "~/.config/rpiv-ask-user-question/config.json";
+	const homeExtraBytes = Buffer.from("{\"enabled\":true}\n");
+	const homeExtraManifest = createManifest({
+		files: [
+			{
+				path: homeExtraPath,
+				type: "file",
+				size: homeExtraBytes.byteLength,
+				sha256: sha256Bytes(homeExtraBytes),
+			},
+		],
+		externalResources: [],
+		packageSpecs: [],
+		warnings: [],
+	});
+	const homeExtraZip = createLatestZip(
+		new Map([
+			[`files/${homeExtraPath}`, homeExtraBytes],
+			[
+				"manifest.json",
+				Buffer.from(`${JSON.stringify(homeExtraManifest, null, 2)}\n`, "utf8"),
+			],
+		]),
+		homeExtraManifest,
+	);
+	assert.throws(
+		() => parseArchive(homeExtraZip.zipBytes, homeExtraZip.latest.zipSha256),
+		/not allowlisted/,
+		"custom manifest paths should require local authorization",
+	);
+	assert.doesNotThrow(
+		() =>
+			parseArchive(homeExtraZip.zipBytes, homeExtraZip.latest.zipSha256, {
+				extraDirs: ["~/.config/rpiv-ask-user-question"],
+			}),
+		"an authorized custom directory should accept descendant manifest paths",
+	);
+	assert.throws(
+		() =>
+			parseArchive(homeExtraZip.zipBytes, homeExtraZip.latest.zipSha256, {
+				extraFiles: ["~/.config/rpiv-ask-user-question/other.json"],
+			}),
+		/not allowlisted/,
+		"extraFiles authorization should only match the exact path",
+	);
+
+	const directoryRootZip = createRegularFileZip([
+		["custom-config", Buffer.from("not a directory\n")],
+	]);
+	assert.throws(
+		() =>
+			parseArchive(
+				directoryRootZip.zipBytes,
+				directoryRootZip.latest.zipSha256,
+				{ extraDirs: ["custom-config"] },
+			),
+		/not allowlisted/,
+		"an extra directory should not authorize replacing its root with a file",
+	);
+
+	const builtinArchive = parseArchive(zip.zipBytes, zip.latest.zipSha256);
+	const typeMismatchAgent = path.join(tempRoot, "type-mismatch-agent");
+	await fs.mkdir(path.join(typeMismatchAgent, "bad-file"), { recursive: true });
+	await fs.writeFile(path.join(typeMismatchAgent, "AGENTS.md"), "must survive\n");
+	await assert.rejects(
+		() =>
+			applyArchiveToAgent(typeMismatchAgent, builtinArchive, {
+				extraFiles: ["bad-file"],
+			}),
+		/Configured file is not a file/,
+		"a configured type mismatch should fail before clearing built-in files",
+	);
+	assert.equal(
+		await fs.readFile(path.join(typeMismatchAgent, "AGENTS.md"), "utf8"),
+		"must survive\n",
+		"type preflight failure should leave built-in files untouched",
+	);
+
+	const symlinkAgent = path.join(tempRoot, "symlink-agent");
+	const symlinkTarget = path.join(tempRoot, "symlink-target");
+	await fs.mkdir(symlinkAgent, { recursive: true });
+	await fs.mkdir(symlinkTarget, { recursive: true });
+	await fs.writeFile(path.join(symlinkAgent, "AGENTS.md"), "must survive\n");
+	const configuredLink = path.join(symlinkAgent, "linked-config");
+	await fs.symlink(
+		symlinkTarget,
+		configuredLink,
+		process.platform === "win32" ? "junction" : "dir",
+	);
+	await assert.rejects(
+		() =>
+			applyArchiveToAgent(symlinkAgent, builtinArchive, {
+				extraDirs: ["linked-config"],
+			}),
+		/Configured path is a symlink/,
+		"a configured leaf symlink should fail before clearing built-in files",
+	);
+	assert.equal(
+		(await fs.lstat(configuredLink)).isSymbolicLink(),
+		true,
+		"symlink preflight failure should preserve the configured link",
+	);
+	assert.equal(
+		await fs.readFile(path.join(symlinkAgent, "AGENTS.md"), "utf8"),
+		"must survive\n",
+		"symlink preflight failure should leave built-in files untouched",
+	);
+
+	const hierarchyZip = createRegularFileZip([
+		["custom-config/node", Buffer.from("parent\n")],
+		["custom-config/node/child.json", Buffer.from("child\n")],
+	]);
+	const hierarchyArchive = parseArchive(
+		hierarchyZip.zipBytes,
+		hierarchyZip.latest.zipSha256,
+		{ extraDirs: ["custom-config"] },
+	);
+	const hierarchyAgent = path.join(tempRoot, "hierarchy-agent");
+	await fs.mkdir(hierarchyAgent, { recursive: true });
+	await fs.writeFile(path.join(hierarchyAgent, "AGENTS.md"), "must survive\n");
+	await assert.rejects(
+		() =>
+			applyArchiveToAgent(hierarchyAgent, hierarchyArchive, {
+				extraDirs: ["custom-config"],
+			}),
+		/conflicts with descendant path/,
+		"parent-file conflicts should fail before clearing built-in files",
+	);
+	assert.equal(
+		await fs.readFile(path.join(hierarchyAgent, "AGENTS.md"), "utf8"),
+		"must survive\n",
+		"archive target conflict should leave built-in files untouched",
+	);
+
+	const aliasAgent = path.join(testHome, "alias-agent");
+	await fs.mkdir(aliasAgent, { recursive: true });
+	await fs.writeFile(path.join(aliasAgent, "AGENTS.md"), "must survive\n");
+	await assert.rejects(
+		() =>
+			applyArchiveToAgent(aliasAgent, builtinArchive, {
+				extraFiles: ["shared"],
+				extraDirs: ["~/alias-agent/shared/nested"],
+			}),
+		/Configured file conflicts with descendant path/,
+		"resolved aliases in configured paths should be rejected before clearing",
+	);
+	assert.equal(
+		await fs.readFile(path.join(aliasAgent, "AGENTS.md"), "utf8"),
+		"must survive\n",
+		"configured target conflict should leave built-in files untouched",
+	);
+
+	if (process.platform === "win32") {
+		for (const invalidPath of [
+			"custom-config/bad?.json",
+			"custom-config/file.txt:hidden",
+		]) {
+			const unsafeZip = createUncheckedRegularFileZip([
+				[invalidPath, Buffer.from("unsafe\n")],
+			]);
+			assert.throws(
+				() => parseArchive(unsafeZip, undefined, { extraDirs: ["custom-config"] }),
+				/Unsafe zip path/,
+				`incoming archive should reject Windows-invalid path: ${invalidPath}`,
+			);
+		}
+	}
+
+	if (process.platform === "win32" || process.platform === "darwin") {
+		const caseCollisionZip = createRegularFileZip([
+			["custom-config/A.json", Buffer.from("upper\n")],
+			["custom-config/a.json", Buffer.from("lower\n")],
+		]);
+		const caseCollisionArchive = parseArchive(
+			caseCollisionZip.zipBytes,
+			caseCollisionZip.latest.zipSha256,
+			{ extraDirs: ["custom-config"] },
+		);
+		await assert.rejects(
+			() =>
+				applyArchiveToAgent(hierarchyAgent, caseCollisionArchive, {
+					extraDirs: ["custom-config"],
+				}),
+			/resolve to the same target/,
+			"case-insensitive target collisions should be rejected",
+		);
+		assert.equal(
+			await fs.readFile(path.join(hierarchyAgent, "AGENTS.md"), "utf8"),
+			"must survive\n",
+			"case collision should leave built-in files untouched",
+		);
+		if (process.platform === "darwin") {
+			const unicodeCollisionZip = createRegularFileZip([
+				["custom-config/\u00e9.json", Buffer.from("nfc\n")],
+				["custom-config/e\u0301.json", Buffer.from("nfd\n")],
+			]);
+			const unicodeCollisionArchive = parseArchive(
+				unicodeCollisionZip.zipBytes,
+				unicodeCollisionZip.latest.zipSha256,
+				{ extraDirs: ["custom-config"] },
+			);
+			await assert.rejects(
+				() =>
+					applyArchiveToAgent(hierarchyAgent, unicodeCollisionArchive, {
+						extraDirs: ["custom-config"],
+					}),
+				/resolve to the same target/,
+				"Unicode-normalization collisions should be rejected on macOS",
+			);
+		}
+	}
 
 	await writeTestConfig(sourceAgent);
 	const cancelledBackend = new MemoryBackend();
@@ -350,8 +669,8 @@ try {
 	);
 	assert.equal(
 		pushPreview.fileCount,
-		zip.latest.fileCount,
-		"push confirmation should expose file count",
+		zip.latest.fileCount + 3,
+		"push confirmation should include configured extra paths",
 	);
 
 	const backend = new MemoryBackend();
@@ -427,6 +746,29 @@ try {
 		"pull should restore skill",
 	);
 	assert.equal(
+		await fs.readFile(path.join(targetAgent, "hermes-memory-config.json"), "utf8"),
+		"source memory config\n",
+		"pull should restore a configured extra file",
+	);
+	assert.equal(
+		await fs.readFile(path.join(testHome, ".pi", "web-search.json"), "utf8"),
+		"source home config\n",
+		"pull should restore a configured home-relative file",
+	);
+	assert.equal(
+		await fs.readFile(
+			path.join(targetAgent, "custom-config", "nested", "config.json"),
+			"utf8",
+		),
+		"source directory config\n",
+		"pull should restore files under a configured extra directory",
+	);
+	assert.equal(
+		await exists(path.join(targetAgent, "custom-config", "old-only.json")),
+		false,
+		"pull should replace a configured extra directory",
+	);
+	assert.equal(
 		await exists(path.join(targetAgent, "old-only.txt")),
 		true,
 		"non-allowlisted file should not be touched",
@@ -469,8 +811,8 @@ try {
 		path.join(targetAgent, ".webdav-sync", "backups"),
 	);
 	assert.equal(backups.length, 1, "pull should create one local backup");
-	const { archive } = await loadBackup(targetAgent, "latest");
-	await applyArchiveToAgent(targetAgent, archive);
+	const { archive } = await loadBackup(targetAgent, "latest", extraPaths);
+	await applyArchiveToAgent(targetAgent, archive, extraPaths);
 	assert.equal(
 		await fs.readFile(path.join(targetAgent, "AGENTS.md"), "utf8"),
 		"old target\n",
@@ -481,9 +823,28 @@ try {
 		true,
 		"restore should recover pre-pull allowlisted dir",
 	);
+	assert.equal(
+		await fs.readFile(path.join(targetAgent, "hermes-memory-config.json"), "utf8"),
+		"old target memory config\n",
+		"restore should recover the pre-pull extra file",
+	);
+	assert.equal(
+		await fs.readFile(path.join(testHome, ".pi", "web-search.json"), "utf8"),
+		"old target home config\n",
+		"restore should recover the pre-pull home-relative file",
+	);
+	assert.equal(
+		await fs.readFile(path.join(targetAgent, "custom-config", "old-only.json"), "utf8"),
+		"old directory config\n",
+		"restore should recover the pre-pull extra directory",
+	);
 
 	console.log("self-test passed");
 } finally {
+	if (originalHome === undefined) delete process.env.HOME;
+	else process.env.HOME = originalHome;
+	if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+	else process.env.USERPROFILE = originalUserProfile;
 	await fs.rm(tempRoot, { recursive: true, force: true });
 }
 
@@ -495,12 +856,16 @@ async function seedSourceAgent(agentDir, externalDir) {
 		{ recursive: true },
 	);
 	await fs.mkdir(path.join(agentDir, "prompts"), { recursive: true });
+	await fs.mkdir(path.join(agentDir, "custom-config", "nested"), {
+		recursive: true,
+	});
 	await fs.mkdir(path.join(agentDir, "npm", "pkg"), { recursive: true });
 	await fs.mkdir(path.join(agentDir, "git", "pkg"), { recursive: true });
 	await fs.mkdir(path.join(agentDir, "sessions"), { recursive: true });
 	await fs.mkdir(path.join(agentDir, ".webdav-sync", "backups"), {
 		recursive: true,
 	});
+	await fs.mkdir(path.join(testHome, ".pi"), { recursive: true });
 	await fs.mkdir(path.join(externalDir, "src"), { recursive: true });
 	await fs.mkdir(path.join(externalDir, "node_modules", "bad"), {
 		recursive: true,
@@ -519,6 +884,18 @@ async function seedSourceAgent(agentDir, externalDir) {
 	await fs.writeFile(
 		path.join(agentDir, "extensions", "foo", "index.js"),
 		"export default {};\n",
+	);
+	await fs.writeFile(
+		path.join(agentDir, "hermes-memory-config.json"),
+		"source memory config\n",
+	);
+	await fs.writeFile(
+		path.join(agentDir, "custom-config", "nested", "config.json"),
+		"source directory config\n",
+	);
+	await fs.writeFile(
+		path.join(testHome, ".pi", "web-search.json"),
+		"source home config\n",
 	);
 	await fs.writeFile(
 		path.join(agentDir, "extensions", "foo", "node_modules", "bad", "bad.js"),
@@ -579,6 +956,7 @@ async function writeTestConfig(agentDir) {
 				username: "user",
 				passwordEnv: "PI_WEBDAV_TEST_PASSWORD",
 				remoteDir: "/pi",
+				...extraPaths,
 			},
 			null,
 			2,
@@ -589,6 +967,7 @@ async function writeTestConfig(agentDir) {
 async function seedTargetAgent(agentDir) {
 	await fs.mkdir(path.join(agentDir, "extensions", "old"), { recursive: true });
 	await fs.mkdir(path.join(agentDir, "skills", "old"), { recursive: true });
+	await fs.mkdir(path.join(agentDir, "custom-config"), { recursive: true });
 	await fs.writeFile(path.join(agentDir, "AGENTS.md"), "old target\n");
 	await fs.writeFile(
 		path.join(agentDir, "settings.json"),
@@ -599,7 +978,65 @@ async function seedTargetAgent(agentDir) {
 		"old\n",
 	);
 	await fs.writeFile(path.join(agentDir, "skills", "old", "old.md"), "old\n");
+	await fs.writeFile(
+		path.join(agentDir, "hermes-memory-config.json"),
+		"old target memory config\n",
+	);
+	await fs.writeFile(
+		path.join(agentDir, "custom-config", "old-only.json"),
+		"old directory config\n",
+	);
+	await fs.mkdir(path.join(testHome, ".pi"), { recursive: true });
+	await fs.writeFile(
+		path.join(testHome, ".pi", "web-search.json"),
+		"old target home config\n",
+	);
 	await fs.writeFile(path.join(agentDir, "old-only.txt"), "keep\n");
+}
+
+function createUncheckedRegularFileZip(files) {
+	const manifest = createManifest({
+		files: files.map(([filePath, bytes]) => ({
+			path: filePath,
+			type: "file",
+			size: bytes.byteLength,
+			sha256: sha256Bytes(bytes),
+		})),
+		externalResources: [],
+		packageSpecs: [],
+		warnings: [],
+	});
+	return zipSync({
+		...Object.fromEntries(
+			files.map(([filePath, bytes]) => [`files/${filePath}`, bytes]),
+		),
+		"manifest.json": Buffer.from(
+			`${JSON.stringify(manifest, null, 2)}\n`,
+			"utf8",
+		),
+	});
+}
+
+function createRegularFileZip(files) {
+	const manifest = createManifest({
+		files: files.map(([filePath, bytes]) => ({
+			path: filePath,
+			type: "file",
+			size: bytes.byteLength,
+			sha256: sha256Bytes(bytes),
+		})),
+		externalResources: [],
+		packageSpecs: [],
+		warnings: [],
+	});
+	const entries = new Map(
+		files.map(([filePath, bytes]) => [`files/${filePath}`, bytes]),
+	);
+	entries.set(
+		"manifest.json",
+		Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8"),
+	);
+	return createLatestZip(entries, manifest);
 }
 
 async function exists(filePath) {
