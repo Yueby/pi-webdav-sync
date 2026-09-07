@@ -138,3 +138,7 @@ pull 只会接受接收机器本地 `settings.webdav.json` 已授权的非内置
 这个 package 没有客户端加密。`auth.json`、`models.json`、`mcp.json` 等可能包含密钥的 allowlist 文件会被包含进 `latest.zip`；WebDAV 服务可以看到 zip 内容。命令输出只打印路径、数量、大小和哈希前缀，不打印文件内容或密码值。
 
 路径安全检查会拒绝不安全 zip 条目（`..`、绝对路径、Windows 盘符路径、反斜杠、重复条目）。恢复时只会写入 agent 目录、明确配置的 `~/` 目标和经过 manifest 校验的外部资源；接收机器本地配置未授权的自定义 manifest 路径会被拒绝。
+
+## 贡献者
+
+- [oversk7](https://github.com/oversk7) — 用户可配置的同步 allowlist

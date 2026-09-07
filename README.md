@@ -138,3 +138,7 @@ Backups are local safety copies. There is no public restore command; use the lat
 This package has no client-side encryption. Secret-bearing allowlist files such as `auth.json`, `models.json`, and `mcp.json` can be included in `latest.zip`; the WebDAV service can see zip contents. Command output prints paths, counts, sizes, and hash prefixes only, not file contents or password values.
 
 Path safety checks reject unsafe zip entries (`..`, absolute paths, Windows drive paths, backslashes, and duplicate entries). Restore writes only to the agent directory, explicitly configured `~/` targets, and manifest-validated external resources. A custom manifest path is rejected unless it is also authorized by the receiving machine's local config.
+
+## Contributors
+
+- [oversk7](https://github.com/oversk7) — user-configurable sync allowlist
