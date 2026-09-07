@@ -2,6 +2,7 @@ import {
 	runWebdavSyncCommand,
 	type InstallProgress,
 	type PushPreview,
+	type RestorePreview,
 	type SnapshotChoice,
 } from "./commands.js";
 
@@ -36,13 +37,25 @@ export function activate(pi: PiLike): void {
 	);
 	register(pi, "webdav-sync:push", "Upload Pi config to WebDAV", "push");
 	register(pi, "webdav-sync:pull", "Download Pi config from WebDAV", "pull");
+	register(
+		pi,
+		"webdav-sync:restore",
+		"Restore local WebDAV sync backup",
+		"restore",
+	);
+	register(
+		pi,
+		"webdav-sync:status",
+		"Compare local Pi config with WebDAV remote",
+		"status",
+	);
 }
 
 function register(
 	pi: PiLike,
 	name: string,
 	description: string,
-	command: "init" | "push" | "pull",
+	command: "init" | "push" | "pull" | "restore" | "status",
 ): void {
 	pi.registerCommand?.(name, {
 		description,
@@ -67,6 +80,14 @@ function register(
 									ctx.ui?.confirm?.(
 										"Overwrite WebDAV config?",
 										`Config already exists:\n${path}\n\nOverwrite it with the template?`,
+							) ?? false
+						: undefined,
+					confirmRestore:
+						command === "restore" && ctx?.ui?.confirm
+							? async (preview: RestorePreview) =>
+									ctx.ui?.confirm?.(
+										"Restore local WebDAV sync backup?",
+										formatRestorePreview(preview),
 									) ?? false
 							: undefined,
 					selectSnapshot: ctx?.ui?.select
@@ -116,6 +137,16 @@ function formatPushPreview(preview: PushPreview): string {
 		}
 	}
 	return lines.join("\n");
+}
+
+function formatRestorePreview(preview: RestorePreview): string {
+	return [
+		`This will overwrite the local allowlist state with backup ${preview.id}.`,
+		`Backup created: ${preview.createdAt}`,
+		`Files: ${preview.fileCount}`,
+		`External resources: ${preview.externalResourceCount}`,
+		`Changes: +${preview.changes.add}/~${preview.changes.modify}/-${preview.changes.remove}`,
+	].join("\n");
 }
 
 function formatInstallProgress(progress: InstallProgress): string {

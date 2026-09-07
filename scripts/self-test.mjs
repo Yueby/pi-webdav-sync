@@ -18,7 +18,7 @@ const { createLatestZip, listZipEntries, parseArchive } = await import(
 const { runWebdavSyncCommand, pruneRemoteSnapshots } = await import(
 	distUrl("commands.js")
 );
-const { loadBackup, applyArchiveToAgent } = await import(distUrl("backup.js"));
+const { applyArchiveToAgent } = await import(distUrl("backup.js"));
 
 class MemoryBackend {
 	files = new Map();
@@ -865,8 +865,83 @@ try {
 		path.join(targetAgent, ".webdav-sync", "backups"),
 	);
 	assert.equal(backups.length, 1, "pull should create one local backup");
-	const { archive } = await loadBackup(targetAgent, "latest", extraPaths);
-	await applyArchiveToAgent(targetAgent, archive, extraPaths);
+
+	const statusEmpty = new MemoryBackend();
+	const statusNone = await runWebdavSyncCommand(["status"], {
+		agentDir: targetAgent,
+		backend: statusEmpty,
+	});
+	assert.match(
+		statusNone.text,
+		/no remote snapshot/,
+		"status should report missing remote snapshot",
+	);
+
+	const statusClean = await runWebdavSyncCommand(["status"], {
+		agentDir: targetAgent,
+		backend,
+	});
+	assert.equal(statusClean.ok, true, "status should work after pull");
+	assert.match(
+		statusClean.text,
+		/up to date/,
+		"status should report up to date right after pull",
+	);
+
+	await fs.writeFile(path.join(targetAgent, "AGENTS.md"), "locally edited\n");
+	const statusDiff = await runWebdavSyncCommand(["status"], {
+		agentDir: targetAgent,
+		backend,
+	});
+	assert.match(
+		statusDiff.text,
+		/local differs from remote/,
+		"status should report local edits",
+	);
+
+	const restoreCancelled = await runWebdavSyncCommand(["restore"], {
+		agentDir: targetAgent,
+		confirmRestore: async () => false,
+	});
+	assert.match(
+		restoreCancelled.text,
+		/restore: cancelled/,
+		"cancelled restore should not apply anything",
+	);
+	assert.equal(
+		(await fs.readdir(path.join(targetAgent, ".webdav-sync", "backups"))).length,
+		1,
+		"cancelled restore should not create a safety backup",
+	);
+
+	const restore = await runWebdavSyncCommand(["restore"], {
+		agentDir: targetAgent,
+		confirmRestore: async () => true,
+	});
+	assert.equal(restore.ok, true, "restore should apply latest backup");
+	assert.match(restore.text, /safety backup: /, "restore should create a safety backup");
+	assert.equal(
+		(await fs.readdir(path.join(targetAgent, ".webdav-sync", "backups"))).length,
+		2,
+		"restore should add one safety backup",
+	);
+
+	const configPath = path.join(targetAgent, "settings.webdav.json");
+	const originalConfig = await fs.readFile(configPath, "utf8");
+	const plaintextConfig = JSON.parse(originalConfig);
+	delete plaintextConfig.passwordEnv;
+	plaintextConfig.password = "plain-secret";
+	await fs.writeFile(configPath, JSON.stringify(plaintextConfig, null, 2));
+	const statusWarn = await runWebdavSyncCommand(["status"], {
+		agentDir: targetAgent,
+		backend,
+	});
+	assert.match(
+		statusWarn.text,
+		/config.password is plaintext/,
+		"status should warn about plaintext password",
+	);
+	await fs.writeFile(configPath, originalConfig);
 	assert.equal(
 		await fs.readFile(path.join(targetAgent, "AGENTS.md"), "utf8"),
 		"old target\n",

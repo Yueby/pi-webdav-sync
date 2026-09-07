@@ -4,11 +4,13 @@ import {
 	createLocalBackup,
 	applyArchiveToAgent,
 	diffArchiveAgainstLocal,
+	loadBackup,
 } from "./backup.js";
 import { collectAgentArchive } from "./collector.js";
 import {
 	configDir,
 	configPath,
+	defaultConfig,
 	readConfig,
 	validateConfig,
 	writeConfig,
@@ -39,6 +41,7 @@ export type CommandContext = {
 	confirmOverwriteConfig?: (path: string) => Promise<boolean>;
 	fetchRemoteConfig?: (url: string) => Promise<unknown>;
 	confirmInstallPackages?: (specs: string[]) => Promise<boolean>;
+	confirmRestore?: (preview: RestorePreview) => Promise<boolean>;
 	installPackage?: (spec: string) => Promise<number | null>;
 	onInstallProgress?: (progress: InstallProgress) => void;
 };
@@ -65,6 +68,14 @@ export type SnapshotChoice = {
 	label: string;
 };
 
+export type RestorePreview = {
+	id: string;
+	createdAt: string;
+	fileCount: number;
+	externalResourceCount: number;
+	changes: { add: number; modify: number; remove: number };
+};
+
 export async function runWebdavSyncCommand(
 	input: string | string[] = [],
 	context: CommandContext = {},
@@ -78,6 +89,9 @@ export async function runWebdavSyncCommand(
 			return await commandInit(agentDir, context, commandArgs);
 		if (command === "push") return await commandPush(agentDir, context);
 		if (command === "pull") return await commandPull(agentDir, context);
+		if (command === "restore")
+			return await commandRestore(agentDir, context, commandArgs);
+		if (command === "status") return await commandStatus(agentDir, context);
 		return ok(helpText());
 	} catch (error) {
 		return fail(error instanceof Error ? error.message : String(error));
@@ -171,6 +185,7 @@ async function commandPush(
 		`packages: ${zip.latest.packageSpecs.length}`,
 		`hash: ${shortHash(zip.latest.contentSha256)}`,
 	];
+	appendPasswordWarning(lines, config);
 	try {
 		const pruned = await pruneRemoteSnapshots(
 			backend,
@@ -224,6 +239,7 @@ async function commandPull(
 		`changes: +${diff.add.length}/~${diff.modify.length}/-${diff.remove.length}`,
 		`hash: ${shortHash(archive.manifest.contentSha256)}`,
 	];
+	appendPasswordWarning(lines, config);
 	if (packages.length && !installResults.length)
 		lines.push(`packages: ${packages.length} not installed`);
 	if (installResults.length) {
@@ -260,6 +276,98 @@ export async function pruneRemoteSnapshots(
 		pruned.push(id);
 	}
 	return pruned;
+}
+
+async function commandRestore(
+	agentDir: string,
+	context: CommandContext,
+	args: string[],
+): Promise<CommandResult> {
+	const config = (await readConfig(agentDir)) ?? defaultConfig();
+	const idOrLatest = args[0] || "latest";
+	const { record, archive } = await loadBackup(agentDir, idOrLatest, config);
+	const diff = await diffArchiveAgainstLocal(agentDir, archive, config);
+	const preview: RestorePreview = {
+		id: record.id,
+		createdAt: record.createdAt,
+		fileCount: archive.manifest.files.length,
+		externalResourceCount: archive.manifest.externalResources.length,
+		changes: {
+			add: diff.add.length,
+			modify: diff.modify.length,
+			remove: diff.remove.length,
+		},
+	};
+	if (context.confirmRestore && !(await context.confirmRestore(preview))) {
+		return ok(
+			[`restore: cancelled`, `backup: ${record.id}`].join("\n"),
+			preview,
+		);
+	}
+	const backup = await createLocalBackup(
+		agentDir,
+		config.backupRetention ?? 5,
+		config,
+	);
+	const applied = await applyArchiveToAgent(agentDir, archive, config);
+	return ok(
+		[
+			`restore: ${record.id}`,
+			`safety backup: ${backup.id}`,
+			`files: ${applied.filesWritten}`,
+			`external: ${applied.externalFilesWritten}`,
+			`changes: +${preview.changes.add}/~${preview.changes.modify}/-${preview.changes.remove}`,
+		].join("\n"),
+		{ backup, applied },
+	);
+}
+
+async function commandStatus(
+	agentDir: string,
+	context: CommandContext,
+): Promise<CommandResult> {
+	const config = await requireConfig(agentDir);
+	const backend = context.backend || createWebdavBackend(config);
+	if (!(await backend.exists("latest.json"))) {
+		return ok("status: no remote snapshot (push first)");
+	}
+	const latest = await backend.getJson<LatestIndex>("latest.json");
+	const zipBytes = await backend.getBytes("latest.zip");
+	const archive = parseArchive(zipBytes, latest.zipSha256, config);
+	validateLatestMatchesManifest(latest, archive);
+	const diff = await diffArchiveAgainstLocal(agentDir, archive, config);
+	const clean =
+		!diff.add.length &&
+		!diff.modify.length &&
+		!diff.remove.length &&
+		!diff.externalAdd.length &&
+		!diff.externalModify.length &&
+		!diff.externalRemove.length;
+	const lines = [
+		`status: ${clean ? "up to date" : "local differs from remote"}`,
+		`remote hash: ${shortHash(archive.manifest.contentSha256)}`,
+		`changes: +${diff.add.length}/~${diff.modify.length}/-${diff.remove.length}`,
+	];
+	if (
+		diff.externalAdd.length ||
+		diff.externalModify.length ||
+		diff.externalRemove.length
+	) {
+		lines.push(
+			`external: +${diff.externalAdd.length}/~${diff.externalModify.length}/-${diff.externalRemove.length}`,
+		);
+	}
+	appendPasswordWarning(lines, config);
+	return ok(lines.join("\n"), { hash: archive.manifest.contentSha256, diff });
+}
+
+function appendPasswordWarning(
+	lines: string[],
+	config: WebdavSyncConfig,
+): void {
+	if (config.password && !config.passwordEnv) {
+		lines.push("warning: config.password is plaintext; prefer passwordEnv");
+	}
 }
 
 async function chooseSnapshot(
@@ -462,11 +570,15 @@ function runPiInstall(spec: string): Promise<number | null> {
 	});
 }
 
-function normalizeCommand(raw?: string): "init" | "push" | "pull" | "help" {
+function normalizeCommand(
+	raw?: string,
+): "init" | "push" | "pull" | "restore" | "status" | "help" {
 	const value = (raw || "").replace(/^webdav-sync:/, "").replace(/^:/, "");
 	if (value === "init") return "init";
 	if (value === "push") return "push";
 	if (value === "pull") return "pull";
+	if (value === "restore") return "restore";
+	if (value === "status") return "status";
 	return "help";
 }
 
@@ -492,9 +604,13 @@ function fail(text: string): CommandResult {
 }
 
 function helpText(): string {
-	return ["/webdav-sync:init", "/webdav-sync:push", "/webdav-sync:pull"].join(
-		"\n",
-	);
+	return [
+		"/webdav-sync:init",
+		"/webdav-sync:push",
+		"/webdav-sync:pull",
+		"/webdav-sync:restore [backup-id]",
+		"/webdav-sync:status",
+	].join("\n");
 }
 
 function splitArgs(input: string): string[] {

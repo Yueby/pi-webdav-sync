@@ -83,6 +83,8 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
 - `/webdav-sync:init [https-url]` - 从模板或远程配置文本创建 `settings.webdav.json`，覆盖前会询问。
 - `/webdav-sync:push` - 显示摘要并询问确认，然后上传 `latest.zip`、`latest.json` 和一个时间戳快照。push 会清理超出 `snapshotRetention`（默认 5）的远端旧快照，只保留最新的。取消后不会上传任何内容。
 - `/webdav-sync:pull` - 选择远程快照，备份本地状态，应用远程配置，并可选择安装快照中的 package specs。
+- `/webdav-sync:restore [backup-id]` - 恢复 `pull`/`restore` 生成的本地备份（默认最新一个）。确认后先创建一份新的安全备份，再应用选中的备份。
+- `/webdav-sync:status` - 比较本地 allowlist 状态与远端 `latest` 快照，报告 `+/~/-` 差异。
 
 当 `installMissingPackages` 为：
 
@@ -131,7 +133,7 @@ pull 只会接受接收机器本地 `settings.webdav.json` 已授权的非内置
 ~/.pi/agent/.webdav-sync/backups/<timestamp>/backup.zip
 ```
 
-备份是本地安全副本。目前没有公开 restore 命令；需要时可以手动使用最新备份。
+备份是本地安全副本。可以用 `/webdav-sync:restore`（或 `/webdav-sync:restore <backup-id>`）恢复；每次 restore 都会先创建新的安全备份再覆盖当前状态。
 
 ## 安全边界
 

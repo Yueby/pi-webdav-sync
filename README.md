@@ -83,6 +83,8 @@ Using `passwordEnv` is recommended. Set `PI_WEBDAV_PASSWORD` locally instead of 
 - `/webdav-sync:init [https-url]` - create `settings.webdav.json` from a template or remote config text, asking before overwrite.
 - `/webdav-sync:push` - show a summary and ask for confirmation, then upload `latest.zip`, `latest.json`, and one timestamped snapshot. Push prunes remote snapshots beyond `snapshotRetention` (default 5), keeping the newest ones. Cancelling does not upload anything.
 - `/webdav-sync:pull` - choose a remote snapshot, back up local state, apply it, and optionally install package specs found in the snapshot.
+- `/webdav-sync:restore [backup-id]` - restore a local backup created by `pull` or `restore` (default: latest). Asks for confirmation, creates a new safety backup first, then applies the selected backup.
+- `/webdav-sync:status` - compare the local allowlist state with the remote `latest` snapshot and report the `+/~/-` differences.
 
 When `installMissingPackages` is:
 
@@ -131,7 +133,7 @@ Before `pull`, the current local built-in and configured extra paths are saved t
 ~/.pi/agent/.webdav-sync/backups/<timestamp>/backup.zip
 ```
 
-Backups are local safety copies. There is no public restore command; use the latest backup manually if needed.
+Backups are local safety copies. Restore one with `/webdav-sync:restore` (or `/webdav-sync:restore <backup-id>`); every restore creates a new safety backup before overwriting the current state.
 
 ## Security boundary
 
