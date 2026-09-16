@@ -15,6 +15,8 @@ export type ExternalResourceEntry = {
   files: ManifestFileEntry[];
 };
 
+export type SettingsMode = "rewrite" | "raw";
+
 export type SyncManifest = {
   schemaVersion: 1;
   formatVersion: 1;
@@ -23,6 +25,8 @@ export type SyncManifest = {
   externalResources: ExternalResourceEntry[];
   packageSpecs: string[];
   settingsRewriteVersion: 1;
+  /** Absent in archives written before this field existed, which means "rewrite". */
+  settingsMode?: SettingsMode;
   warnings: string[];
   contentSha256: string;
 };
@@ -49,7 +53,7 @@ export function shortHash(hash: string): string {
   return hash.slice(0, 12);
 }
 
-export function stableJson(value: unknown): string {
+function stableJson(value: unknown): string {
   return JSON.stringify(sortJson(value));
 }
 
@@ -73,6 +77,7 @@ export function createManifest(input: {
   packageSpecs: string[];
   warnings: string[];
   createdAt?: string;
+  settingsMode?: SettingsMode;
 }): SyncManifest {
   const base = {
     schemaVersion: 1 as const,
@@ -82,6 +87,7 @@ export function createManifest(input: {
     externalResources: [...input.externalResources].sort((a, b) => a.id.localeCompare(b.id)),
     packageSpecs: [...new Set(input.packageSpecs)].sort(),
     settingsRewriteVersion: 1 as const,
+    settingsMode: input.settingsMode || ("rewrite" as const),
     warnings: [...input.warnings],
   };
   const contentSha256 = sha256String(
@@ -90,6 +96,7 @@ export function createManifest(input: {
       externalResources: base.externalResources,
       packageSpecs: base.packageSpecs,
       settingsRewriteVersion: base.settingsRewriteVersion,
+      settingsMode: base.settingsMode,
     }),
   );
   return { ...base, contentSha256 };

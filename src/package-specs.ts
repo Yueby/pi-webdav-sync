@@ -1,7 +1,3 @@
-export type PackageEntry =
-	| string
-	| { source?: unknown; [key: string]: unknown };
-
 const REMOTE_SPEC_PREFIXES = [
 	"npm:",
 	"git:",
@@ -83,6 +79,23 @@ export function redactPackageSpec(spec: string): string {
 		/([a-z][a-z0-9+.-]*:\/\/)([^/@\s:]+(?::[^/@\s]*)?@)/gi,
 		"$1***@",
 	);
+}
+
+const MAX_INSTALL_SPEC_LENGTH = 2048;
+
+/**
+ * Install specs cross a process boundary, so they must be single, flag-free
+ * tokens: a leading "-" would be read as a CLI flag, and whitespace or control
+ * characters could be used to smuggle additional arguments.
+ */
+function isSafeInstallSpec(spec: string): boolean {
+	if (!spec || spec.length > MAX_INSTALL_SPEC_LENGTH) return false;
+	if (spec.startsWith("-")) return false;
+	return !/[\u0000-\u001f\u007f\s"']/.test(spec);
+}
+
+export function isInstallableSpec(spec: string): boolean {
+	return isRemotePackageSpec(spec) && isSafeInstallSpec(spec);
 }
 
 export function clonePackageEntryWithSource(

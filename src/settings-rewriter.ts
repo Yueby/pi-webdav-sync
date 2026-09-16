@@ -195,7 +195,3 @@ function stableResourceId(absolutePath: string): string {
 function hasGlob(value: string): boolean {
 	return /[*?[\]{}]/.test(value);
 }
-
-export function rewrittenSettingsZipPath(): string {
-	return safeRelativePath("files/settings.json");
-}

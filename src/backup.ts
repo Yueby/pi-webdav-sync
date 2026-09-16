@@ -1,13 +1,10 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { collectAgentArchive } from "./collector.js";
+import { collectAgentArchive, type CollectOptions } from "./collector.js";
 import { stateDir } from "./config.js";
 import {
-	ALLOWLIST_DIRS,
-	ALLOWLIST_FILES,
 	isAllowlistedRelativePath,
-	isExcludedRelativePath,
 	normalizeSyncPaths,
 	pathHasSymlinkAncestor,
 	pathInside,
@@ -30,6 +27,8 @@ export type BackupRecord = {
 	zipPath: string;
 	jsonPath: string;
 	createdAt: string;
+	/** Set when the backup came from a remote profile rather than local state. */
+	profile?: string;
 };
 
 export type ApplySummary = {
@@ -43,24 +42,62 @@ export async function createLocalBackup(
 	retention = 5,
 	pathOptions: SyncPathOptions = {},
 ): Promise<BackupRecord> {
-	const collected = await collectAgentArchive(agentDir, pathOptions);
+	// Local safety copies keep settings.json verbatim, so restoring one also
+	// brings back the local-only keys and the original external references.
+	const collected = await collectAgentArchive(agentDir, pathOptions, {
+		settingsMode: "raw",
+	});
 	const zip = createLatestZip(collected.zipEntries, collected.manifest);
+	return await writeBackupRecord(
+		agentDir,
+		Buffer.from(zip.zipBytes),
+		zip.latest,
+		retention,
+	);
+}
+
+/**
+ * Stores a remote snapshot as a local backup, used before an irreversible remote
+ * operation such as deleting a profile. The downloaded archive is the same shape
+ * as a local safety copy, so /webdav-sync:restore can bring it back.
+ */
+export async function saveRemoteArchiveBackup(
+	agentDir: string,
+	zipBytes: Buffer,
+	latest: unknown,
+	retention = 5,
+	profile?: string,
+): Promise<BackupRecord> {
+	return await writeBackupRecord(agentDir, zipBytes, latest, retention, profile);
+}
+
+async function writeBackupRecord(
+	agentDir: string,
+	zipBytes: Buffer,
+	latest: unknown,
+	retention: number,
+	profile?: string,
+): Promise<BackupRecord> {
 	const id = timestampId();
 	const dir = path.join(backupsDir(agentDir), id);
 	await fs.mkdir(dir, { recursive: true });
 	const zipPath = path.join(dir, "backup.zip");
 	const jsonPath = path.join(dir, "backup.json");
-	await fs.writeFile(zipPath, Buffer.from(zip.zipBytes));
-	await fs.writeFile(
-		jsonPath,
-		`${JSON.stringify(zip.latest, null, 2)}\n`,
-		"utf8",
-	);
+	await fs.writeFile(zipPath, zipBytes);
+	const index =
+		profile && latest && typeof latest === "object"
+			? { ...(latest as Record<string, unknown>), profile }
+			: latest;
+	await fs.writeFile(jsonPath, `${JSON.stringify(index, null, 2)}\n`, "utf8");
 	await pruneBackups(agentDir, retention);
-	return { id, dir, zipPath, jsonPath, createdAt: zip.latest.createdAt };
+	const createdAt =
+		latest && typeof latest === "object" && "createdAt" in latest
+			? String((latest as { createdAt?: unknown }).createdAt)
+			: id;
+	return { id, dir, zipPath, jsonPath, createdAt, profile };
 }
 
-export async function listBackups(agentDir: string): Promise<BackupRecord[]> {
+async function listBackups(agentDir: string): Promise<BackupRecord[]> {
 	const root = backupsDir(agentDir);
 	let entries: string[];
 	try {
@@ -77,6 +114,7 @@ export async function listBackups(agentDir: string): Promise<BackupRecord[]> {
 		try {
 			const json = JSON.parse(await fs.readFile(jsonPath, "utf8")) as {
 				createdAt?: string;
+				profile?: string;
 			};
 			await fs.access(zipPath);
 			records.push({
@@ -85,6 +123,7 @@ export async function listBackups(agentDir: string): Promise<BackupRecord[]> {
 				zipPath,
 				jsonPath,
 				createdAt: json.createdAt || id,
+				profile: json.profile,
 			});
 		} catch {
 			// Ignore incomplete backup directories.
@@ -113,7 +152,22 @@ export async function loadBackup(
 		record,
 		archive: parseArchive(zipBytes, latest.zipSha256, pathOptions),
 	};
-}
+}type ArchiveTarget = {
+	logicalPath: string;
+	absolutePath: string;
+	root: string;
+	bytes: Buffer;
+	mode?: number;
+	external: boolean;
+};
+
+type RemovalPlan = {
+	/** Absolute paths of collected files this apply replaces or drops. */
+	files: string[];
+	/** Absolute directories occupying an incoming file path. */
+	dirs: string[];
+	extraPaths: NormalizedSyncPaths;
+};
 
 export async function applyArchiveToAgent(
 	agentDir: string,
@@ -122,31 +176,216 @@ export async function applyArchiveToAgent(
 ): Promise<ApplySummary> {
 	const resolvedAgentDir = path.resolve(agentDir);
 	preflightArchiveTargets(resolvedAgentDir, archive, pathOptions);
-	await clearAllowlistedTargets(resolvedAgentDir, pathOptions);
-	let filesWritten = 0;
-	let externalFilesWritten = 0;
+	await preflightSymlinkFreeTargets(resolvedAgentDir, archive);
+	const targets = archiveTargets(resolvedAgentDir, archive);
+	const removals = await planRemovals(resolvedAgentDir, archive, pathOptions);
+	const filesDeleted = await executeRemovals(resolvedAgentDir, removals);
+	const written = await writeTargets(targets);
+	return { filesDeleted, ...written };
+}
+
+/**
+ * Applies an archive, and restores the given local safety backup if the apply
+ * fails after it started modifying files. Both the primary apply and the rollback
+ * work from plans computed before the first mutation, so a half-written
+ * settings.json can never break recovery. The safety archive is loaded and
+ * validated before anything is touched, and preflight failures propagate as-is.
+ * Rollback is best-effort recovery, not crash-atomic: a process killed mid-apply
+ * needs an explicit /webdav-sync:restore.
+ */
+export async function applyArchiveWithRollback(
+	agentDir: string,
+	archive: ParsedArchive,
+	safetyBackupId: string,
+	pathOptions: SyncPathOptions = {},
+): Promise<ApplySummary> {
+	const resolvedAgentDir = path.resolve(agentDir);
+	preflightArchiveTargets(resolvedAgentDir, archive, pathOptions);
+	const { archive: safety } = await loadBackup(
+		resolvedAgentDir,
+		safetyBackupId,
+		pathOptions,
+	);
+	preflightArchiveTargets(resolvedAgentDir, safety, pathOptions);
+	await preflightSymlinkFreeTargets(resolvedAgentDir, archive);
+	await preflightSymlinkFreeTargets(resolvedAgentDir, safety);
+	await preflightConfiguredPaths(resolvedAgentDir, pathOptions);
+
+	const targets = archiveTargets(resolvedAgentDir, archive);
+	const removals = await planRemovals(resolvedAgentDir, archive, pathOptions);
+	const safetyTargets = archiveTargets(resolvedAgentDir, safety);
+	try {
+		const filesDeleted = await executeRemovals(resolvedAgentDir, removals);
+		const written = await writeTargets(targets);
+		return { filesDeleted, ...written };
+	} catch (error) {
+		const primary = errorMessage(error);
+		let rollbackFailure: string | undefined;
+		try {
+			// Fixed plan: remove everything the failed apply could have touched that
+			// the safety archive does not re-write, then write the safety bytes.
+			const safetyKeys = new Set(
+				safetyTargets.map((target) => restorePathKey(target.absolutePath)),
+			);
+			const rollbackRemovals: RemovalPlan = {
+				files: [
+					...new Set([
+						...removals.files,
+						...targets.map((target) => target.absolutePath),
+					]),
+				].filter((target) => !safetyKeys.has(restorePathKey(target))),
+				dirs: removals.dirs.filter(
+					(target) => !safetyKeys.has(restorePathKey(target)),
+				),
+				extraPaths: removals.extraPaths,
+			};
+			await executeRemovals(resolvedAgentDir, rollbackRemovals);
+			await writeTargets(safetyTargets);
+		} catch (rollbackError) {
+			rollbackFailure = errorMessage(rollbackError);
+		}
+		if (!rollbackFailure)
+			throw new Error(
+				`apply failed and was rolled back from backup ${safetyBackupId}: ${primary}`,
+			);
+		throw new Error(
+			`apply failed: ${primary}; rollback from backup ${safetyBackupId} also failed: ${rollbackFailure}`,
+		);
+	}
+}
+
+/** Absolute write targets derived from the archive alone, with no filesystem reads. */
+function archiveTargets(agentDir: string, archive: ParsedArchive): ArchiveTarget[] {
+	const targets: ArchiveTarget[] = [];
 	for (const file of archive.manifest.files) {
 		const bytes = archive.entries.get(`files/${file.path}`);
 		if (!bytes) throw new Error(`Archive missing file: ${file.path}`);
-		await writeAgentFile(
-			resolvedAgentDir,
-			file.path,
+		const { absolutePath, root } = resolveRestoreTarget(agentDir, file.path);
+		targets.push({
+			logicalPath: file.path,
+			absolutePath,
+			root,
 			bytes,
-			file.mode,
-			pathOptions,
-		);
-		filesWritten += 1;
+			mode: file.mode,
+			external: false,
+		});
 	}
 	for (const resource of archive.manifest.externalResources) {
 		for (const file of resource.files) {
 			const bytes = archive.entries.get(file.path);
 			if (!bytes)
 				throw new Error(`Archive missing external file: ${file.path}`);
-			await writeAgentFile(resolvedAgentDir, file.path, bytes, file.mode);
-			externalFilesWritten += 1;
+			const { absolutePath, root } = resolveRestoreTarget(agentDir, file.path);
+			targets.push({
+				logicalPath: file.path,
+				absolutePath,
+				root,
+				bytes,
+				mode: file.mode,
+				external: true,
+			});
 		}
 	}
-	return { filesWritten, filesDeleted: 0, externalFilesWritten };
+	return targets;
+}
+
+/**
+ * Computes the removal side of an apply before anything is mutated, so rollback
+ * never has to re-read (possibly half-written) settings.json.
+ */
+async function planRemovals(
+	agentDir: string,
+	archive: ParsedArchive,
+	pathOptions: SyncPathOptions,
+): Promise<RemovalPlan> {
+	const extraPaths = await preflightConfiguredPaths(agentDir, pathOptions);
+	const incoming = new Set<string>();
+	for (const target of archiveTargets(agentDir, archive))
+		incoming.add(safeRelativePath(target.logicalPath));
+
+	const local = await collectAgentArchive(agentDir, pathOptions);
+	const files: string[] = [];
+	const seen = new Set<string>();
+	const addTarget = (logicalPath: string) => {
+		if (incoming.has(safeRelativePath(logicalPath))) return;
+		const { absolutePath } = resolveRestoreTarget(agentDir, logicalPath);
+		const key = restorePathKey(absolutePath);
+		if (seen.has(key)) return;
+		seen.add(key);
+		files.push(absolutePath);
+	};
+	for (const file of local.manifest.files) addTarget(file.path);
+	for (const resource of local.manifest.externalResources)
+		for (const file of resource.files) addTarget(file.path);
+
+	// Directories sitting where the archive writes a file are only replaceable
+	// while they are empty, otherwise the write fails and rollback takes over.
+	const dirs: string[] = [];
+	for (const target of archiveTargets(agentDir, archive)) {
+		const stat = await lstatIfExists(target.absolutePath);
+		if (stat?.isDirectory()) dirs.push(target.absolutePath);
+	}
+	return { files, dirs, extraPaths };
+}
+
+async function executeRemovals(
+	agentDir: string,
+	plan: RemovalPlan,
+): Promise<number> {
+	let deleted = 0;
+	const parents = new Set<string>();
+	for (const file of plan.files) {
+		if (await removeFileIfPresent(file)) {
+			deleted += 1;
+			parents.add(path.dirname(file));
+		}
+	}
+	for (const dir of plan.dirs) {
+		try {
+			await fs.rmdir(dir);
+		} catch {
+			continue;
+		}
+		parents.add(path.dirname(dir));
+	}
+	await pruneEmptyDirectories(agentDir, plan.extraPaths, parents);
+	return deleted;
+}
+
+async function writeTargets(targets: ArchiveTarget[]): Promise<{
+	filesWritten: number;
+	externalFilesWritten: number;
+}> {
+	let filesWritten = 0;
+	let externalFilesWritten = 0;
+	for (const target of targets) {
+		await assertWritePathIsUsable(
+			target.root,
+			target.absolutePath,
+			target.logicalPath,
+		);
+		await fs.mkdir(path.dirname(target.absolutePath), { recursive: true });
+		await fs.writeFile(target.absolutePath, target.bytes);
+		if (target.mode)
+			await fs.chmod(target.absolutePath, target.mode & 0o777).catch(
+				() => undefined,
+			);
+		if (target.external) externalFilesWritten += 1;
+		else filesWritten += 1;
+	}
+	return { filesWritten, externalFilesWritten };
+}
+
+/**
+ * Raw local backups keep settings.json verbatim and still collect the external
+ * resources it references; remote snapshots store the rewritten copy. The mode is
+ * declared by the archive itself, and archives written before the field existed
+ * are treated as rewritten.
+ */
+export function archiveSettingsMode(
+	archive: ParsedArchive,
+): "rewrite" | "raw" {
+	return archive.manifest.settingsMode === "raw" ? "raw" : "rewrite";
 }
 
 export type ArchiveDiff = {
@@ -162,8 +401,9 @@ export async function diffArchiveAgainstLocal(
 	agentDir: string,
 	archive: ParsedArchive,
 	pathOptions: SyncPathOptions = {},
+	options: CollectOptions = {},
 ): Promise<ArchiveDiff> {
-	const local = await collectAgentArchive(agentDir, pathOptions);
+	const local = await collectAgentArchive(agentDir, pathOptions, options);
 	const regular = diffHashes(
 		new Map(local.manifest.files.map((file) => [file.path, file.sha256])),
 		new Map(archive.manifest.files.map((file) => [file.path, file.sha256])),
@@ -180,7 +420,7 @@ export async function diffArchiveAgainstLocal(
 	};
 }
 
-export function backupsDir(agentDir: string): string {
+function backupsDir(agentDir: string): string {
 	return path.join(stateDir(agentDir), "backups");
 }
 
@@ -225,10 +465,11 @@ function preflightArchiveTargets(
 	validateResolvedTargetConflicts(targets, "Restore");
 }
 
-async function preflightConfiguredTargets(
+async function preflightConfiguredPaths(
 	agentDir: string,
-	extraPaths: NormalizedSyncPaths,
-): Promise<void> {
+	pathOptions: SyncPathOptions = {},
+): Promise<NormalizedSyncPaths> {
+	const extraPaths = normalizeSyncPaths(pathOptions);
 	const targets: ResolvedTarget[] = [
 		...extraPaths.extraFiles.map((logicalPath) => ({
 			logicalPath,
@@ -271,6 +512,7 @@ async function preflightConfiguredTargets(
 			throw new Error(`Configured directory is not a directory: ${target.logicalPath}`);
 		}
 	}
+	return extraPaths;
 }
 
 function validateResolvedTargetConflicts(
@@ -302,54 +544,138 @@ function validateResolvedTargetConflicts(
 	}
 }
 
-async function clearAllowlistedTargets(
-	agentDir: string,
-	pathOptions: SyncPathOptions,
-): Promise<void> {
-	const extraPaths = normalizeSyncPaths(pathOptions);
-	await preflightConfiguredTargets(agentDir, extraPaths);
+async function removeFileIfPresent(absolutePath: string): Promise<boolean> {
+	const stat = await lstatIfExists(absolutePath);
+	if (!stat || !stat.isFile()) return false;
+	await fs.rm(absolutePath, { force: true });
+	return true;
+}
 
-	for (const file of ALLOWLIST_FILES)
-		await fs.rm(path.join(agentDir, file), { force: true });
-	for (const dir of ALLOWLIST_DIRS)
-		await fs.rm(path.join(agentDir, dir), { recursive: true, force: true });
-	await fs.rm(path.join(agentDir, "external-resources"), {
-		recursive: true,
-		force: true,
-	});
-	for (const file of extraPaths.extraFiles) {
-		if (isExcludedRelativePath(file, false)) continue;
-		await fs.rm(resolveConfiguredPath(file, agentDir), { force: true });
-	}
-	for (const dir of extraPaths.extraDirs) {
-		if (isExcludedRelativePath(dir, true)) continue;
-		await fs.rm(resolveConfiguredPath(dir, agentDir), {
-			recursive: true,
-			force: true,
-		});
+/** Removes empty directories left behind, bounded by the roots sync manages. */
+async function pruneEmptyDirectories(
+	agentDir: string,
+	extraPaths: NormalizedSyncPaths,
+	candidates: Set<string>,
+): Promise<void> {
+	const roots: Array<{ dir: string; inclusive: boolean }> = [
+		{ dir: agentDir, inclusive: false },
+		...extraPaths.extraDirs.map((dir) => ({
+			dir: resolveConfiguredPath(dir, agentDir),
+			inclusive: true,
+		})),
+		...extraPaths.extraFiles.map((file) => ({
+			dir: path.dirname(resolveConfiguredPath(file, agentDir)),
+			inclusive: false,
+		})),
+	];
+	const protectedKeys = new Set([
+		restorePathKey(agentDir),
+		restorePathKey(os.homedir()),
+	]);
+	const canRemove = (directory: string): boolean => {
+		const key = restorePathKey(directory);
+		if (protectedKeys.has(key)) return false;
+		return roots.some(
+			(root) =>
+				pathInside(root.dir, directory) &&
+				(root.inclusive || restorePathKey(root.dir) !== key),
+		);
+	};
+	const ordered = [...candidates].sort((a, b) => b.length - a.length);
+	for (const start of ordered) {
+		let current = start;
+		while (canRemove(current)) {
+			const stat = await lstatIfExists(current);
+			if (!stat || !stat.isDirectory()) break;
+			try {
+				await fs.rmdir(current);
+			} catch {
+				break;
+			}
+			current = path.dirname(current);
+		}
 	}
 }
 
-async function writeAgentFile(
-	agentDir: string,
-	relativePath: string,
-	bytes: Buffer,
-	mode?: number,
-	pathOptions: SyncPathOptions = {},
+/**
+ * Refuses to write through a symlink. Collection skips symlinks, so without this
+ * an archive could write outside the authorized roots through a pre-existing
+ * symlink such as agentDir/AGENTS.md -> ~/.ssh/authorized_keys. Only symlinks are
+ * rejected here; a non-directory ancestor may still be a managed file that this
+ * same apply deletes before writing.
+ */
+async function assertPathHasNoSymlink(
+	root: string,
+	absolutePath: string,
+	logicalPath: string,
 ): Promise<void> {
-	const safeRel = safeRelativePath(relativePath);
-	if (!isAllowlistedRelativePath(safeRel, pathOptions) && !isExternalResourcePath(safeRel))
-		throw new Error(`Restore path is not allowlisted: ${relativePath}`);
-	const { absolutePath } = resolveRestoreTarget(agentDir, safeRel);
-	await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-	await fs.writeFile(absolutePath, bytes);
-	if (mode) await fs.chmod(absolutePath, mode & 0o777).catch(() => undefined);
+	const resolvedRoot = path.resolve(root);
+	const resolvedTarget = path.resolve(absolutePath);
+	if (!pathInside(resolvedRoot, resolvedTarget))
+		throw new Error(`Unsafe restore path: ${logicalPath}`);
+	const parts = path
+		.relative(resolvedRoot, resolvedTarget)
+		.split(path.sep)
+		.filter(Boolean);
+	let current = resolvedRoot;
+	for (const part of parts) {
+		current = path.join(current, part);
+		const stat = await lstatIfExists(current);
+		if (!stat) return;
+		if (stat.isSymbolicLink())
+			throw new Error(
+				`Refusing to write through a symlink (${logicalPath}): ${current}`,
+			);
+		// Nothing below a non-directory can be a symlink; the write-time check
+		// reports the ancestor itself when it is still unusable after removals.
+		if (!stat.isDirectory()) return;
+	}
+}
+
+/** Adds the write-time check that every existing ancestor is a directory. */
+async function assertWritePathIsUsable(
+	root: string,
+	absolutePath: string,
+	logicalPath: string,
+): Promise<void> {
+	await assertPathHasNoSymlink(root, absolutePath, logicalPath);
+	const resolvedRoot = path.resolve(root);
+	const parts = path
+		.relative(resolvedRoot, path.resolve(absolutePath))
+		.split(path.sep)
+		.filter(Boolean);
+	let current = resolvedRoot;
+	for (const part of parts.slice(0, -1)) {
+		current = path.join(current, part);
+		const stat = await lstatIfExists(current);
+		if (!stat) return;
+		if (!stat.isDirectory())
+			throw new Error(
+				`Restore path has a non-directory parent (${logicalPath}): ${current}`,
+			);
+	}
+}
+
+async function preflightSymlinkFreeTargets(
+	agentDir: string,
+	archive: ParsedArchive,
+): Promise<void> {
+	for (const file of archive.manifest.files) {
+		const target = resolveRestoreTarget(agentDir, file.path);
+		await assertPathHasNoSymlink(target.root, target.absolutePath, file.path);
+	}
+	for (const resource of archive.manifest.externalResources) {
+		for (const file of resource.files) {
+			const target = resolveRestoreTarget(agentDir, file.path);
+			await assertPathHasNoSymlink(target.root, target.absolutePath, file.path);
+		}
+	}
 }
 
 function resolveRestoreTarget(
 	agentDir: string,
 	relativePath: string,
-): { safePath: string; absolutePath: string } {
+): { safePath: string; absolutePath: string; root: string } {
 	const safePath = safeRelativePath(relativePath);
 	validatePathForCurrentPlatform(safePath);
 	const externalResource = isExternalResourcePath(safePath);
@@ -360,7 +686,7 @@ function resolveRestoreTarget(
 	if (!pathInside(restoreRoot, absolutePath)) {
 		throw new Error(`Unsafe restore path: ${relativePath}`);
 	}
-	return { safePath, absolutePath };
+	return { safePath, absolutePath, root: restoreRoot };
 }
 
 function restorePathKey(value: string): string {
@@ -373,7 +699,10 @@ async function lstatIfExists(absolutePath: string) {
 	try {
 		return await fs.lstat(absolutePath);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		// ENOTDIR: a parent component is a regular file, so this path cannot
+		// exist on POSIX (Windows reports ENOENT for the same situation).
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return undefined;
 		throw error;
 	}
 }
@@ -419,6 +748,10 @@ async function pruneBackups(
 	const remove = backups.slice(0, Math.max(0, backups.length - retention));
 	for (const backup of remove)
 		await fs.rm(backup.dir, { recursive: true, force: true });
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function timestampId(): string {

@@ -44,7 +44,7 @@ export function getAgentDir(explicit?: string): string {
   return path.resolve(expandHome(value));
 }
 
-export function expandHome(value: string): string {
+function expandHome(value: string): string {
   if (value === "~") return os.homedir();
   if (value.startsWith("~/") || value.startsWith("~\\")) {
     return path.join(os.homedir(), value.slice(2));
@@ -56,7 +56,7 @@ export function toPosixPath(value: string): string {
   return value.replace(/\\/g, "/");
 }
 
-export function normalizeRelativePath(value: string): string {
+function normalizeRelativePath(value: string): string {
   const normalized = path.posix.normalize(toPosixPath(value));
   return normalized === "." ? "" : normalized;
 }

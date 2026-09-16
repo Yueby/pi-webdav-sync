@@ -9,7 +9,7 @@ import type { WebdavSyncConfig } from "../config.js";
 import { safeRelativePath, toPosixPath } from "../paths.js";
 import type { RemoteListEntry, SyncBackend } from "./types.js";
 
-export class WebdavBackend implements SyncBackend {
+class WebdavBackend implements SyncBackend {
 	private readonly client: WebDAVClient;
 	private readonly remoteDir: string;
 
@@ -61,11 +61,6 @@ export class WebdavBackend implements SyncBackend {
 		return this.client.exists(this.fullPath(remotePath));
 	}
 
-	async copy(fromPath: string, toPath: string): Promise<void> {
-		await this.ensureRemoteDir();
-		await this.client.copyFile(this.fullPath(fromPath), this.fullPath(toPath));
-	}
-
 	async delete(remotePath: string): Promise<void> {
 		try {
 			await this.client.deleteFile(this.fullPath(remotePath));
@@ -85,6 +80,44 @@ export class WebdavBackend implements SyncBackend {
 			size: item.size,
 			lastModified: item.lastmod,
 		}));
+	}
+
+	async listIfExists(remotePath = "."): Promise<RemoteListEntry[]> {
+		const full = this.fullPath(remotePath);
+		try {
+			if (!(await this.client.exists(full))) return [];
+		} catch (error) {
+			if (isNotFoundRemoteError(error)) return [];
+			throw error;
+		}
+		try {
+			return await this.list(remotePath);
+		} catch (error) {
+			if (isNotFoundRemoteError(error)) return [];
+			throw error;
+		}
+	}
+
+	async createDirectory(remotePath: string): Promise<boolean> {
+		await this.ensureRemoteParentDir(remotePath);
+		try {
+			await this.client.createDirectory(this.fullPath(remotePath), {
+				recursive: false,
+			});
+			return true;
+		} catch (error) {
+			if (isAlreadyThereRemoteError(error)) return false;
+			throw error;
+		}
+	}
+
+	async move(remotePath: string, destinationPath: string): Promise<void> {
+		await this.ensureRemoteParentDir(destinationPath);
+		await this.client.moveFile(
+			this.fullPath(remotePath),
+			this.fullPath(destinationPath),
+			{ overwrite: false },
+		);
 	}
 
 	private async ensureRemoteDir(): Promise<void> {
@@ -116,6 +149,29 @@ export class WebdavBackend implements SyncBackend {
 
 export function createWebdavBackend(config: WebdavSyncConfig): SyncBackend {
 	return new WebdavBackend(config);
+}
+
+/**
+ * Only 404 is a confirmed "collection is not there" answer. Other statuses,
+ * including 409, propagate so a conflict is never reported as an empty remote.
+ */
+function isNotFoundRemoteError(error: unknown): boolean {
+	return (error as WebDAVClientError).status === 404;
+}
+
+/** 405 (MKCOL on an existing collection) and 409 are the "already there" answers. */
+function isAlreadyThereRemoteError(error: unknown): boolean {
+	const status = (error as WebDAVClientError).status;
+	return status === 405 || status === 409;
+}
+
+/**
+ * MOVE is optional in WebDAV: 405/501 mean the server does not implement it, and
+ * some hosts reject it with 403 while still allowing the PUT fallback.
+ */
+export function isMoveUnsupportedRemoteError(error: unknown): boolean {
+	const status = (error as WebDAVClientError).status;
+	return status === 403 || status === 405 || status === 501;
 }
 
 function resolvePassword(config: WebdavSyncConfig): string | undefined {

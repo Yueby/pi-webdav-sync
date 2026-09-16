@@ -1,6 +1,10 @@
+import { redactPackageSpec } from "./package-specs.js";
+import type { ProfileChoice } from "./profiles.js";
 import {
 	runWebdavSyncCommand,
 	type InstallProgress,
+	type ProfileDeletePreview,
+	type ProfileMigratePreview,
 	type PushPreview,
 	type RestorePreview,
 	type SnapshotChoice,
@@ -12,6 +16,10 @@ type CommandUiContext = {
 		select?: (
 			message: string,
 			choices: string[],
+		) => Promise<string | undefined>;
+		input?: (
+			message: string,
+			placeholder?: string,
 		) => Promise<string | undefined>;
 		confirm?: (title: string, message: string) => Promise<boolean>;
 		setStatus?: (key: string, text: string | undefined) => void;
@@ -35,8 +43,18 @@ export function activate(pi: PiLike): void {
 		"Create WebDAV sync config template",
 		"init",
 	);
-	register(pi, "webdav-sync:push", "Upload Pi config to WebDAV", "push");
-	register(pi, "webdav-sync:pull", "Download Pi config from WebDAV", "pull");
+	register(
+		pi,
+		"webdav-sync:push",
+		"Upload Pi config to a WebDAV profile",
+		"push",
+	);
+	register(
+		pi,
+		"webdav-sync:pull",
+		"Download Pi config from a WebDAV profile",
+		"pull",
+	);
 	register(
 		pi,
 		"webdav-sync:restore",
@@ -46,8 +64,14 @@ export function activate(pi: PiLike): void {
 	register(
 		pi,
 		"webdav-sync:status",
-		"Compare local Pi config with WebDAV remote",
+		"Compare local Pi config with a WebDAV profile",
 		"status",
+	);
+	register(
+		pi,
+		"webdav-sync:profiles",
+		"Manage WebDAV sync profiles (interactive menu)",
+		"profiles",
 	);
 }
 
@@ -55,7 +79,7 @@ function register(
 	pi: PiLike,
 	name: string,
 	description: string,
-	command: "init" | "push" | "pull" | "restore" | "status",
+	command: "init" | "push" | "pull" | "restore" | "status" | "profiles",
 ): void {
 	pi.registerCommand?.(name, {
 		description,
@@ -70,7 +94,7 @@ function register(
 						command === "push" && ctx?.ui?.confirm
 							? async (preview: PushPreview) =>
 									ctx.ui?.confirm?.(
-										"Push Pi config to WebDAV?",
+										`Push Pi config to profile ${preview.profile}?`,
 										formatPushPreview(preview),
 									) ?? false
 							: undefined,
@@ -82,6 +106,22 @@ function register(
 										`Config already exists:\n${path}\n\nOverwrite it with the template?`,
 							) ?? false
 						: undefined,
+					confirmProfileMigrate:
+						command === "profiles" && ctx?.ui?.confirm
+							? async (preview: ProfileMigratePreview) =>
+									ctx.ui?.confirm?.(
+										"Migrate the remote to the profiles/ layout?",
+										formatProfileMigratePreview(preview),
+									) ?? false
+							: undefined,
+					confirmProfileDelete:
+						command === "profiles" && ctx?.ui?.confirm
+							? async (preview: ProfileDeletePreview) =>
+									ctx.ui?.confirm?.(
+										`Delete remote profile ${preview.profile}?`,
+										formatProfileDeletePreview(preview),
+									) ?? false
+							: undefined,
 					confirmRestore:
 						command === "restore" && ctx?.ui?.confirm
 							? async (preview: RestorePreview) =>
@@ -90,6 +130,25 @@ function register(
 										formatRestorePreview(preview),
 									) ?? false
 							: undefined,
+					selectProfile: ctx?.ui?.select
+						? async (choices: ProfileChoice[], message?: string) => {
+								const labels = choices.map((choice) => choice.label);
+								const selected = await ctx.ui?.select?.(
+									message ?? "Select WebDAV profile:",
+									labels,
+								);
+								return choices.find((choice) => choice.label === selected)?.id;
+							}
+						: undefined,
+					inputProfileName: ctx?.ui?.input
+						? async (existing: string[]) =>
+								(await ctx.ui?.input?.(
+									"New WebDAV profile name:",
+									existing.length
+										? `existing: ${existing.join(", ")}`
+										: "lowercase letters, digits, dot, dash, underscore",
+								)) ?? undefined
+						: undefined,
 					selectSnapshot: ctx?.ui?.select
 						? async (choices: SnapshotChoice[]) => {
 								const labels = choices.map((choice) => choice.label);
@@ -106,7 +165,7 @@ function register(
 									"Install missing Pi packages?",
 									[
 										`Pull found ${specs.length} package(s) in the snapshot:`,
-										...specs,
+										...specs.map(redactPackageSpec),
 									].join("\n"),
 								) ?? false
 						: undefined,
@@ -139,17 +198,44 @@ function formatPushPreview(preview: PushPreview): string {
 	return lines.join("\n");
 }
 
+function formatProfileMigratePreview(preview: ProfileMigratePreview): string {
+	return [
+		`This moves the pre-profile data at the remote root into "${preview.profile}".`,
+		`Objects: ${preview.objectCount}`,
+		`Snapshots: ${preview.snapshotCount}`,
+		preview.lastUpdated ? `Last updated: ${preview.lastUpdated}` : undefined,
+		"A local backup is stored first, and unrelated files at the remote root are not touched.",
+	]
+		.filter((line): line is string => line !== undefined)
+		.join("\n");
+}
+
+function formatProfileDeletePreview(preview: ProfileDeletePreview): string {
+	return [
+		`This deletes the remote profile "${preview.profile}" from the WebDAV server.`,
+		`Objects: ${preview.objectCount}`,
+		`Snapshots: ${preview.snapshotCount}`,
+		preview.lastUpdated ? `Last updated: ${preview.lastUpdated}` : undefined,
+		"Local Pi files are not touched.",
+	]
+		.filter((line): line is string => line !== undefined)
+		.join("\n");
+}
+
 function formatRestorePreview(preview: RestorePreview): string {
 	return [
 		`This will overwrite the local allowlist state with backup ${preview.id}.`,
 		`Backup created: ${preview.createdAt}`,
+		preview.profile ? `Source profile: ${preview.profile}` : undefined,
 		`Files: ${preview.fileCount}`,
 		`External resources: ${preview.externalResourceCount}`,
 		`Changes: +${preview.changes.add}/~${preview.changes.modify}/-${preview.changes.remove}`,
-	].join("\n");
+	]
+		.filter((line): line is string => line !== undefined)
+		.join("\n");
 }
 
-function formatInstallProgress(progress: InstallProgress): string {
+export function formatInstallProgress(progress: InstallProgress): string {
 	const done = completedInstallCount(progress);
 	const bar = progressBar(done, progress.total);
 	if (progress.phase === "start") {
@@ -160,10 +246,14 @@ function formatInstallProgress(progress: InstallProgress): string {
 	}
 	const current = (progress.index ?? 0) + 1;
 	if (progress.phase === "package_start") {
-		return `${bar} ${done}/${progress.total} installing ${current}: ${progress.spec}`;
+		return `${bar} ${done}/${progress.total} installing ${current}: ${redactedSpec(progress)}`;
 	}
 	const marker = progress.ok ? "ok" : "failed";
-	return `${bar} ${done}/${progress.total} ${marker}: ${progress.spec}`;
+	return `${bar} ${done}/${progress.total} ${marker}: ${redactedSpec(progress)}`;
+}
+
+function redactedSpec(progress: InstallProgress): string {
+	return redactPackageSpec(progress.spec ?? "");
 }
 
 function completedInstallCount(progress: InstallProgress): number {

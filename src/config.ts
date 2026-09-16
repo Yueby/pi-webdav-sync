@@ -21,6 +21,21 @@ export type WebdavSyncConfig = {
   extraDirs?: string[];
 };
 
+/** Keys accepted in settings.webdav.json. Unknown keys are rejected, not ignored. */
+const CONFIG_KEYS = new Set([
+  "backend",
+  "remoteBaseUrl",
+  "username",
+  "passwordEnv",
+  "password",
+  "remoteDir",
+  "installMissingPackages",
+  "backupRetention",
+  "snapshotRetention",
+  "extraFiles",
+  "extraDirs",
+]);
+
 export function configDir(agentDir = getAgentDir()): string {
   return agentDir;
 }
@@ -63,6 +78,14 @@ export function validateConfig(value: unknown): WebdavSyncConfig {
     throw new Error("config must be an object");
   }
   const input = value as Record<string, unknown>;
+  const unknown = Object.keys(input).filter(
+    (key) => !CONFIG_KEYS.has(key) && !key.startsWith("$"),
+  );
+  if (unknown.length) {
+    throw new Error(
+      `Unknown config key(s): ${unknown.join(", ")}. Supported keys: ${[...CONFIG_KEYS].join(", ")}; keys starting with "$" are ignored`,
+    );
+  }
   const config: WebdavSyncConfig = { ...defaultConfig(), ...(input as Partial<WebdavSyncConfig>) };
   if (config.backend !== "webdav") throw new Error("only webdav backend is supported by config schema");
   for (const key of ["remoteBaseUrl", "username", "passwordEnv", "password", "remoteDir"] as const) {

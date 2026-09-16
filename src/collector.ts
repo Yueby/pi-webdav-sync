@@ -32,6 +32,17 @@ export type CollectedArchive = {
 	warnings: string[];
 };
 
+export type CollectOptions = {
+	/**
+	 * Which settings.json content the archive stores: "rewrite" (default, the
+	 * portable copy) or "raw" (verbatim, for local safety backups that must be
+	 * able to restore local-only keys such as shellPath and sessionDir).
+	 * External resources referenced by settings.json are collected either way, so
+	 * a backup always contains every file the restore path can replace.
+	 */
+	settingsMode?: "rewrite" | "raw";
+};
+
 type MutableExternalResource = {
 	id: string;
 	originalPathHash: string;
@@ -52,6 +63,7 @@ type CollectState = {
 export async function collectAgentArchive(
 	agentDir: string,
 	pathOptions: SyncPathOptions = {},
+	options: CollectOptions = {},
 ): Promise<CollectedArchive> {
 	const resolvedAgentDir = path.resolve(agentDir);
 	const state: CollectState = {
@@ -68,7 +80,11 @@ export async function collectAgentArchive(
 		const absolutePath = path.join(resolvedAgentDir, fileName);
 		if (await exists(absolutePath)) {
 			if (fileName === "settings.json") {
-				await addRewrittenSettings(state, absolutePath);
+				await addRewrittenSettings(
+					state,
+					absolutePath,
+					options.settingsMode === "raw" ? "raw" : "rewrite",
+				);
 			} else {
 				await addAllowlistFile(state, absolutePath, fileName);
 			}
@@ -101,6 +117,7 @@ export async function collectAgentArchive(
 		externalResources: state.externalResources as ExternalResourceEntry[],
 		packageSpecs: state.packageSpecs,
 		warnings: state.warnings,
+		settingsMode: options.settingsMode === "raw" ? "raw" : "rewrite",
 	});
 	state.zipEntries.set(
 		"manifest.json",
@@ -120,20 +137,27 @@ export async function collectAgentArchive(
 async function addRewrittenSettings(
 	state: CollectState,
 	absolutePath: string,
+	settingsMode: "rewrite" | "raw",
 ): Promise<void> {
 	const rewrite = await rewriteSettingsFile(state.agentDir, absolutePath);
 	for (const warning of rewrite.warnings) state.warnings.push(warning);
 	state.packageSpecs.push(...rewrite.packageSpecs);
 
 	const relativePath = "settings.json";
-	addZipEntry(state, `files/${relativePath}`, rewrite.content);
+	// The rewrite result is still used to discover external references; only the
+	// stored settings bytes differ between modes.
+	const content =
+		settingsMode === "raw"
+			? await fs.readFile(absolutePath)
+			: rewrite.content;
+	addZipEntry(state, `files/${relativePath}`, content);
 	const resolvedAbsolutePath = absolutePathValue(absolutePath);
 	state.includedAbsolutePaths.set(
 		absolutePathKey(resolvedAbsolutePath),
 		resolvedAbsolutePath,
 	);
 	state.manifestFiles.push(
-		fileEntry(relativePath, rewrite.content, await modeOf(absolutePath)),
+		fileEntry(relativePath, content, await modeOf(absolutePath)),
 	);
 
 	for (const reference of rewrite.externalReferences) {
