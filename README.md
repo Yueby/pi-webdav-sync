@@ -82,7 +82,7 @@ Using `passwordEnv` is recommended. Set `PI_WEBDAV_PASSWORD` locally instead of 
 
 - `/webdav-sync:init [https-url]` - create `settings.webdav.json` from a template or remote config text, asking before overwrite.
 - `/webdav-sync:push [--profile <name> | --create-profile <name>]` - pick a profile (existing or create a new one), show a summary and ask for confirmation, then upload `latest.zip`, `latest.json`, and one timestamped snapshot. Push prunes remote snapshots beyond `snapshotRetention` (default 5), keeping the newest ones. Cancelling the profile picker, the name input, or the confirmation does not upload anything.
-- `/webdav-sync:pull [--profile <name>] [snapshot-id|latest]` - pick a profile, then a remote snapshot, back up local state, apply it, and optionally install package specs found in the snapshot. Cancelling either picker aborts the pull without downloading or applying anything; when no interactive picker is available, pass `--profile` and an explicit snapshot id.
+- `/webdav-sync:pull [--profile <name>] [--select] [snapshot-id|latest]` - pick a profile, then a remote snapshot, then what to apply: the whole profile (replaces the local config) or only picked files (the `Space`/`Enter` tree, applied in place). It backs up local state first, applies it, and optionally installs package specs found in the snapshot. Cancelling any picker aborts without downloading or applying anything; with no interactive picker it applies everything and needs `--profile` plus an explicit snapshot id.
 - `/webdav-sync:restore [backup-id]` - restore a local backup created by `pull` or `restore` (default: latest). Asks for confirmation, creates a new safety backup first, then applies the selected backup. Local backups are not profile-scoped.
 - `/webdav-sync:status [--profile <name>]` - compare the local allowlist state with that profile's remote `latest` snapshot and report the `+/~/-` differences.
 - `/webdav-sync:profiles [delete <name> [--yes] | rename <old> [new] | migrate [--yes]]` - manage remote profiles interactively, or with these arguments for scripts.
@@ -93,7 +93,13 @@ When `installMissingPackages` is:
 - `always` - install packages automatically.
 - `never` - do not install packages.
 
+Only packages this machine is actually missing are offered: a spec counts as present when the local `settings.json` lists it (versions and `npm:` prefixes are compared by package name) or when its directory exists under Pi's `~/.pi/agent/npm/node_modules/` (or the project-level `.pi/npm/node_modules/`). A full pull therefore stays quiet on a machine that already has everything, and a selective pull only offers packages when `settings.json` is part of the selection — taking a single extension file never asks to sync packages.
+
 ## Profiles
+
+Selective pull walks the snapshot's tree and writes only what you pick. The walk starts at the top of the profile: `Space` selects the highlighted file or the whole folder, `Enter` expands/collapses a folder (and selects a file), `←`/`→` collapse/expand, `Esc` cancels, and the `✓ Pull N selection(s) into the local config` row applies the selection. The tree shows indented children with `▾`/`▸` and keeps `✓` marks across levels. Applying writes the selected files to their local targets (allowlist files, configured extra paths, `external-resources/` content), takes a local safety backup first, and leaves every other local file untouched — nothing is deleted, so the rest of the config stays as it was. `--select` skips the `Everything`/`Choose files…` question and goes straight to the tree.
+
+In RPC and print modes, where a custom TUI component is unavailable, the walk falls back to one level per picker: `Enter` descends into a folder and the `☑ whole directory` row at the top of a level selects everything below it.
 
 Profiles are separate remote namespaces, so one machine can upload different configurations and choose which one to pull. They do not change which local files are collected: the allowlist, `extraFiles`, and `extraDirs` stay global, so every profile holds the same file set with different contents.
 
@@ -107,7 +113,7 @@ profiles/<name>/latest.zip | latest.json       every other profile looks the sam
 profiles/<name>/snapshots/<id>.zip | json
 ```
 
-`layout.json` holds `{"tool":"pi-webdav-sync","layoutVersion":2}`. A remote written by a newer version is refused instead of being modified, so an older client cannot damage a newer remote.
+`layout.json` holds `{"tool":"pi-webdav-sync","layoutVersion":2}`. A remote written by a newer version is left untouched and the command fails, so an older client leaves a newer remote intact.
 
 Compatibility: this layout was introduced in 0.3.0. A 0.2.x client only knows the root layout, so pointing an un-upgraded machine at an already-migrated remote reports no remote snapshot; upgrade every machine that shares the remote.
 
@@ -119,8 +125,9 @@ Snapshot retention applies per profile, so pruning one profile never touches ano
 
 Prompts (TUI):
 
-- `/webdav-sync:push` opens a profile picker listing every existing profile plus `＋ Create profile…`. Choosing create asks for the name, and the confirmation dialog names the destination profile. Cancelling any dialog uploads nothing.
-- `/webdav-sync:pull` asks which profile when more than one exists, then the snapshot picker; `/webdav-sync:status` asks the same way. Cancelling either aborts before anything is downloaded, backed up, or applied.
+- `/webdav-sync:push` opens a profile picker listing every existing profile plus `＋ Create profile…`. The profile you used last comes first and is marked `(current)`, so one Enter repeats it. Choosing create asks for the name, and the confirmation dialog names the destination profile. Cancelling any dialog uploads nothing.
+- `/webdav-sync:pull` asks which profile when more than one exists (the remembered one pinned first), then the snapshot picker, then `✓ Everything (replace the local config)` or `Choose files…`; `/webdav-sync:status` asks the profile the same way. Cancelling any step aborts before anything is downloaded, backed up, or applied.
+- The profile in use is remembered per machine in `.webdav-sync/state.json`, next to the local backups, and is never uploaded. It records the profile you actually pushed to or pulled from — opening the picker and cancelling changes nothing, and neither does a command that fails. Deleting the profile forgets it and renaming it follows the new name. A single-profile remote still asks nothing at all.
 - `/webdav-sync:profiles` opens an action menu: `List profiles`, `Delete a profile…`, `Rename a profile…`, plus `Migrate legacy layout…` when pre-profile data is still at the remote root. Delete asks which profile and shows a confirmation preview; rename asks which profile and then for the new name.
 - Every dialog can be skipped with the equivalent arguments (`--profile`, `--create-profile`, `delete <name> --yes`, `rename <old> [new]`, `migrate --yes`), which is what non-interactive runs use. Without a picker the commands fall back to `default` unless `--profile` is given, and `pull` still requires an explicit snapshot id.
 
@@ -153,7 +160,7 @@ Always excluded at any depth:
 - log files and temporary files
 - symlinks are not followed; they are reported as warnings
 
-Excluded entries are also never deleted: `pull` removes only the paths it would collect, so an excluded subtree such as `extensions/node_modules/` survives a pull instead of being destroyed with its parent directory.
+Excluded entries are also never deleted: `pull` removes only the paths it would collect, so an excluded subtree such as `extensions/node_modules/` survives a pull.
 
 `settings.json` is copied through a rewrite step. Local-machine settings are removed before sync:
 
@@ -185,8 +192,4 @@ Path safety checks reject unsafe zip entries (`..`, absolute paths, Windows driv
 
 Package installs run the pi CLI as a Node script, never through a shell. Specs that start with `-`, contain whitespace or control characters, or exceed 2048 characters are skipped and reported. Confirmation dialogs and progress output show specs with URL credentials redacted.
 
-Archive size is bounded (20000 entries, 64 MiB per file, 256 MiB total, 32 MiB compressed) and the same limits apply when creating an archive, so push and backup fail loudly instead of producing a snapshot that cannot be read back. Duplicate entry names and content that fails the manifest hashes are rejected; ZIP64 archives are not specifically supported.
-
-## Contributors
-
-- [oversk7](https://github.com/oversk7) — user-configurable sync allowlist
+Archive size is bounded (20000 entries, 64 MiB per file, 256 MiB total, 32 MiB compressed) and the same limits apply when creating an archive, so an oversized configuration fails the push or backup with the limit in the message. Duplicate entry names and content that fails the manifest hashes are rejected; ZIP64 archives are not specifically supported.

@@ -48,6 +48,50 @@ export function stateDir(agentDir = getAgentDir()): string {
   return path.join(agentDir, ".webdav-sync");
 }
 
+/**
+ * Machine-local preferences. They live next to the backups, are never part of a
+ * snapshot, and a missing or unreadable file must never break a sync.
+ */
+export type LocalState = {
+  /** Profile the last push, pull, or status worked on. */
+  currentProfile?: string;
+};
+
+export function statePath(agentDir = getAgentDir()): string {
+  return path.join(stateDir(agentDir), "state.json");
+}
+
+export async function readLocalState(agentDir = getAgentDir()): Promise<LocalState> {
+  try {
+    const raw = await fs.readFile(statePath(agentDir), "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const value = (parsed as { currentProfile?: unknown }).currentProfile;
+    return typeof value === "string" && value.trim() ? { currentProfile: value.trim() } : {};
+  } catch {
+    // A corrupt or unreadable preferences file is treated as "nothing remembered".
+    return {};
+  }
+}
+
+/** Merges a patch into the local state; `undefined` removes a key. */
+export async function writeLocalState(
+  patch: LocalState,
+  agentDir = getAgentDir(),
+): Promise<void> {
+  const next: LocalState = { ...(await readLocalState(agentDir)) };
+  for (const [key, value] of Object.entries(patch) as Array<[keyof LocalState, string | undefined]>) {
+    if (value === undefined) delete next[key];
+    else next[key] = value;
+  }
+  const target = statePath(agentDir);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  // Write through a temporary file so a crash cannot leave a half-written state.
+  const temporary = `${target}.tmp`;
+  await fs.writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  await fs.rename(temporary, target);
+}
+
 export function defaultConfig(): WebdavSyncConfig {
   return {
     backend: "webdav",

@@ -3,6 +3,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+	applyArchivePaths,
 	applyArchiveWithRollback,
 	archiveSettingsMode,
 	createLocalBackup,
@@ -17,13 +18,15 @@ import {
 	configPath,
 	defaultConfig,
 	readConfig,
+	readLocalState,
 	validateConfig,
 	writeConfig,
+	writeLocalState,
 	type WebdavSyncConfig,
 } from "./config.js";
 import { createLatestIndex, type LatestIndex, shortHash } from "./manifest.js";
 import { getAgentDir, pathInside } from "./paths.js";
-import { isInstallableSpec, missingInstallSpecs } from "./package-specs.js";
+import { isInstallableSpec, npmPackageName, extractPackageSpecs } from "./package-specs.js";
 import {
 	DEFAULT_PROFILE,
 	LAYOUT_MARKER,
@@ -45,10 +48,15 @@ import {
 	type ProfileObject,
 } from "./profiles.js";
 import {
+	archiveFilePaths,
 	createLatestZip,
 	parseArchive,
 	type ParsedArchive,
 } from "./zip-store.js";
+import {
+	choosePathsFallback,
+	selectArchivePaths,
+} from "./path-select.js";
 import { createWebdavBackend } from "./backends/webdav.js";
 import { isMoveUnsupportedRemoteError } from "./backends/webdav.js";
 import { scopedBackend } from "./backends/scoped.js";
@@ -76,6 +84,11 @@ export type CommandContext = {
 	confirmRestore?: (preview: RestorePreview) => Promise<boolean>;
 	confirmProfileDelete?: (preview: ProfileDeletePreview) => Promise<boolean>;
 	confirmProfileMigrate?: (preview: ProfileMigratePreview) => Promise<boolean>;
+	/** TUI tree picker (Space selects, Enter expands); falls back to selectProfile. */
+	choosePaths?: (
+		profileName: string,
+		files: string[],
+	) => Promise<string[] | undefined>;
 	installPackage?: (spec: string) => Promise<number | null>;
 	onInstallProgress?: (progress: InstallProgress) => void;
 };
@@ -93,16 +106,8 @@ type ParsedArgs = {
 	profile?: string;
 	createProfile?: string;
 	assumeYes?: boolean;
+	select?: boolean;
 	positional: string[];
-};
-
-type ProfileTarget = {
-	name: string;
-	backend: SyncBackend;
-	/** True when this command intends to create the profile. */
-	created: boolean;
-	/** True when the target is the pre-profile layout at the remote root. */
-	legacyRoot?: boolean;
 };
 
 export type ProfileDeletePreview = {
@@ -126,6 +131,15 @@ export type InstallProgress = {
 	total: number;
 	ok?: boolean;
 	code?: number | null;
+};
+
+type ProfileTarget = {
+	name: string;
+	backend: SyncBackend;
+	/** True when this command intends to create the profile. */
+	created: boolean;
+	/** True when the target is the pre-profile layout at the remote root. */
+	legacyRoot?: boolean;
 };
 
 export type SnapshotChoice = {
@@ -152,6 +166,10 @@ export async function runWebdavSyncCommand(
 	const commandArgs = inputArgs.slice(1);
 	const agentDir = getAgentDir(context.agentDir);
 	try {
+		if (!command)
+			throw new Error(
+				`Unknown command: ${inputArgs[0] || "(none)"}; available: init, push, pull, restore, status, profiles`,
+			);
 		if (command === "init")
 			return await commandInit(agentDir, context, commandArgs);
 		if (command === "push")
@@ -164,7 +182,7 @@ export async function runWebdavSyncCommand(
 			return await commandStatus(agentDir, context, commandArgs);
 		if (command === "profiles")
 			return await commandProfiles(agentDir, context, commandArgs);
-		return ok(helpText());
+		throw new Error(`Unhandled command: ${String(command)}`);
 	} catch (error) {
 		return fail(error instanceof Error ? error.message : String(error));
 	}
@@ -234,7 +252,7 @@ async function commandPush(
 	const target = await resolveProfileTarget(rootBackend, context, parsed, {
 		allowCreate: true,
 		requireExisting: false,
-	});
+	}, agentDir);
 	if (!target)
 		return ok(
 			["push: cancelled", "nothing was uploaded", ...notes].join("\n"),
@@ -309,7 +327,62 @@ async function commandPush(
 			`snapshot prune failed: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
+	// The profile only becomes "current" once something was actually uploaded.
+	await rememberProfile(agentDir, target.name);
 	return ok(lines.join("\n"), { ...zip.latest, profile: target.name });
+}
+
+const SELECT_ID = "__select__";
+
+/**
+ * Asks whether the whole profile should be applied or only picked files, then
+ * returns the selection (an empty list means "everything").
+ */
+async function choosePullScope(
+	context: CommandContext,
+	profileName: string,
+	archive: ParsedArchive,
+	selectRequested: boolean,
+): Promise<{ cancelled: boolean; paths?: string[] }> {
+	if (!selectRequested && !context.choosePaths && !context.selectProfile)
+		return { cancelled: false };
+	if (!selectRequested && context.selectProfile) {
+		const scope = await context.selectProfile(
+			[
+				{ id: "all", label: "✓ Everything (replace the local config)" },
+				{ id: SELECT_ID, label: "Choose files… (only apply the selection)" },
+			],
+			`Pull from ${profileName}: what should be applied?`,
+		);
+		if (!scope) return { cancelled: true };
+		if (scope !== SELECT_ID) return { cancelled: false };
+	}
+	const selection = await selectPathsInteractively(
+		context,
+		profileName,
+		archive,
+	);
+	if (selection === undefined) return { cancelled: true };
+	return { cancelled: false, paths: selectArchivePaths(archive, selection) };
+}
+
+/**
+ * Runs the tree picker when a custom component is available, and the plain
+ * level-by-level picker otherwise.
+ */
+async function selectPathsInteractively(
+	context: CommandContext,
+	profileName: string,
+	archive: ParsedArchive,
+): Promise<string[] | undefined> {
+	if (context.choosePaths) {
+		try {
+			return await context.choosePaths(profileName, archiveFilePaths(archive));
+		} catch {
+			// No custom component available (RPC/print): use the plain picker.
+		}
+	}
+	return await choosePathsFallback(context.selectProfile, profileName, archive);
 }
 
 async function commandPull(
@@ -325,10 +398,16 @@ async function commandPull(
 	await assertSupportedLayout(rootBackend);
 	const notes: string[] = [];
 	await autoMigrateLegacyLayout(rootBackend, agentDir, config, notes);
-	const target = await resolveProfileTarget(rootBackend, context, parsed, {
-		allowCreate: false,
-		requireExisting: true,
-	});
+	const target = await resolveProfileTarget(
+		rootBackend,
+		context,
+		parsed,
+		{
+			allowCreate: false,
+			requireExisting: true,
+		},
+		agentDir,
+	);
 	if (!target)
 		return ok(
 			["pull: cancelled", "nothing was downloaded or applied"].join("\n"),
@@ -350,18 +429,37 @@ async function commandPull(
 	const archive = parseArchive(zipBytes, latest.zipSha256, config);
 	validateLatestMatchesManifest(latest, archive);
 	const diff = await diffArchiveAgainstLocal(agentDir, archive, config);
-	const packages = missingInstallSpecs(await settingsJsonFromArchive(archive));
+	const scope = await choosePullScope(
+		context,
+		target.name,
+		archive,
+		parsed.select === true,
+	);
+	if (scope.cancelled)
+		return ok(
+			["pull: cancelled", "nothing was downloaded or applied"].join("\n"),
+			{ cancelled: true },
+		);
+	const snapshotSettings = await settingsJsonFromArchive(archive);
+	// A selective pull leaves the machine's settings.json alone unless it is part of
+	// the selection, so packages only matter when that file travels with it.
+	const packages =
+		!scope.paths || scope.paths.includes("settings.json")
+			? await missingPackagesOnThisMachine(agentDir, snapshotSettings)
+			: [];
 	const backup = await createLocalBackup(
 		agentDir,
 		config.backupRetention ?? 5,
 		config,
 	);
-	const applied = await applyArchiveWithRollback(
-		agentDir,
-		archive,
-		backup.id,
-		config,
-	);
+	const applied = scope.paths
+		? await applyArchivePaths(agentDir, archive, scope.paths, config)
+		: await applyArchiveWithRollback(
+				agentDir,
+				archive,
+				backup.id,
+				config,
+			);
 	const shouldInstall = await shouldInstallPackages(
 		packages,
 		config,
@@ -377,6 +475,7 @@ async function commandPull(
 	const lines = [
 		`pull: ${target.name === DEFAULT_PROFILE ? snapshot.id : `${target.name}/${snapshot.id}`}`,
 		`profile: ${target.name}`,
+		`mode: ${scope.paths ? `selected (${scope.paths.length} file(s))` : "everything"}`,
 		`backup: ${backup.id}`,
 		`files: ${applied.filesWritten}`,
 		`external: ${applied.externalFilesWritten}`,
@@ -405,6 +504,8 @@ async function commandPull(
 		lines.push(
 			`packages: ${unresolved.length} not installed (pi CLI not found; run "pi install <spec>" manually)`,
 		);
+	// The profile only becomes "current" once something was actually downloaded.
+	await rememberProfile(agentDir, target.name);
 	return ok(lines.join("\n"), {
 		profile: target.name,
 		snapshot: snapshot.id,
@@ -508,10 +609,16 @@ async function commandStatus(
 	const config = await requireConfig(agentDir);
 	const rootBackend = context.backend || createWebdavBackend(config);
 	await assertSupportedLayout(rootBackend);
-	const target = await resolveProfileTarget(rootBackend, context, parsed, {
-		allowCreate: false,
-		requireExisting: false,
-	});
+	const target = await resolveProfileTarget(
+		rootBackend,
+		context,
+		parsed,
+		{
+			allowCreate: false,
+			requireExisting: false,
+		},
+		agentDir,
+	);
 	if (!target) return ok("status: cancelled", { cancelled: true });
 	const backend = target.backend;
 	if (!(await backend.exists("latest.json"))) {
@@ -580,7 +687,7 @@ async function commandProfiles(
 			rest,
 		);
 	if (subcommand === "rename")
-		return await renameProfile(context, backend, parsed, rest);
+		return await renameProfile(context, backend, agentDir, parsed, rest);
 	if (subcommand === "migrate")
 		return await migrateLegacyRoot(
 			context,
@@ -620,7 +727,7 @@ async function commandProfiles(
 				[],
 			);
 		if (action === PROFILE_ACTION_RENAME)
-			return await renameProfile(context, backend, parsed, []);
+			return await renameProfile(context, backend, agentDir, parsed, []);
 		if (action === PROFILE_ACTION_MIGRATE)
 			return await migrateLegacyRoot(
 				context,
@@ -723,6 +830,7 @@ async function deleteProfile(
 	// A profile owns everything inside its directory; the legacy root profile owns
 	// only the objects this tool wrote at the remote root, never the root itself.
 	await deleteProfileObjects(rootBackend, target, objects);
+	await moveRememberedProfile(agentDir, target.name);
 	return ok(
 		[
 			`profiles delete: ${target.name}`,
@@ -737,6 +845,7 @@ async function deleteProfile(
 async function renameProfile(
 	context: CommandContext,
 	rootBackend: SyncBackend,
+	agentDir: string,
 	parsed: ParsedArgs,
 	args: string[],
 ): Promise<CommandResult> {
@@ -804,6 +913,7 @@ async function renameProfile(
 			await copyObjectVerified(source.backend, targetBackend, object.path);
 		await deleteProfileObjects(rootBackend, source, objects);
 	}
+	await moveRememberedProfile(agentDir, source.name, destination);
 	return ok(
 		[
 			`profiles rename: ${source.name} -> ${destination}`,
@@ -1093,17 +1203,18 @@ async function pickProfileName(
 /**
  * Resolves the profile a command works on. Explicit flags win; otherwise an
  * available picker is used when the choice is ambiguous (or when a new profile
- * may be created); otherwise the root-backed default profile is used.
+ * may be created); otherwise the root-backed default profile is used. Resolving
+ * only reads the remembered profile (to offer it first) — the commands record it
+ * once they actually uploaded or downloaded something.
  */
 async function resolveProfileTarget(
 	rootBackend: SyncBackend,
 	context: CommandContext,
 	parsed: ParsedArgs,
 	options: { allowCreate: boolean; requireExisting: boolean },
+	agentDir: string,
 ): Promise<ProfileTarget | undefined> {
-	if (parsed.createProfile) {
-		return await claimNewProfile(rootBackend, parsed.createProfile);
-	}
+	if (parsed.createProfile) return await claimNewProfile(rootBackend, parsed.createProfile);
 	if (parsed.profile) return await existingProfileTarget(rootBackend, parsed.profile);
 
 	// A remote whose only usable profile is not "default" must stay reachable
@@ -1116,9 +1227,9 @@ async function resolveProfileTarget(
 		if (selectable.length > 1 || options.allowCreate) {
 			// Unsupported remote names are reported by /webdav-sync:profiles, never
 			// offered here: a row that can only fail is worse than an explained gap.
-			const choices = options.allowCreate
-				? withCreateChoice(profiles)
-				: selectable;
+			const base = options.allowCreate ? withCreateChoice(profiles) : selectable;
+			// The profile in use comes first so one Enter repeats it.
+			const choices = await orderByRememberedProfile(agentDir, base);
 			const selectedId = await context.selectProfile(choices);
 			if (!selectedId) return undefined;
 			const selected = choices.find((choice) => choice.id === selectedId);
@@ -1130,9 +1241,51 @@ async function resolveProfileTarget(
 			return await existingProfileTarget(rootBackend, selected.id);
 		}
 	}
-	return await existingProfileTarget(rootBackend, soleSelectable ?? DEFAULT_PROFILE, {
-		requireExisting: options.requireExisting,
-	});
+	return await existingProfileTarget(
+		rootBackend,
+		soleSelectable ?? DEFAULT_PROFILE,
+		{ requireExisting: options.requireExisting },
+	);
+}
+
+/**
+ * Reads the profile the user works with, so a picker can offer it first. A profile
+ * that vanished from the remote is simply not pinned; the next choice replaces it.
+ */
+async function orderByRememberedProfile(
+	agentDir: string,
+	choices: ProfileChoice[],
+): Promise<ProfileChoice[]> {
+	const current = (await readLocalState(agentDir)).currentProfile;
+	if (!current) return choices;
+	const index = choices.findIndex((choice) => choice.id === current);
+	if (index < 0) return choices;
+	const marked = {
+		...choices[index],
+		label: `${choices[index].label} (current)`,
+	};
+	return [marked, ...choices.filter((_, position) => position !== index)];
+}
+
+/** Records the profile a command actually used, for the next picker. */
+async function rememberProfile(agentDir: string, name: string): Promise<void> {
+	const current = (await readLocalState(agentDir)).currentProfile;
+	if (current === name) return;
+	await writeLocalState({ currentProfile: name }, agentDir);
+}
+
+/**
+ * Keeps the remembered profile honest: deleting it forgets it, renaming it
+ * follows to the new name. Anything else is left alone.
+ */
+async function moveRememberedProfile(
+	agentDir: string,
+	from: string,
+	to?: string,
+): Promise<void> {
+	const current = (await readLocalState(agentDir)).currentProfile;
+	if (current !== from) return;
+	await writeLocalState({ currentProfile: to }, agentDir);
 }
 
 async function existingProfileTarget(
@@ -1336,6 +1489,64 @@ async function settingsJsonFromArchive(
 	const bytes = archive.entries.get("files/settings.json");
 	if (!bytes) return undefined;
 	return JSON.parse(bytes.toString("utf8"));
+}
+
+/**
+ * Package specs from a snapshot that this machine does not have yet. The machine's
+ * own settings.json knows about every kind of install; npm specs are additionally
+ * checked against Pi's npm roots, because a settings list can be stale.
+ */
+async function missingPackagesOnThisMachine(
+	agentDir: string,
+	snapshotSettings: unknown,
+): Promise<string[]> {
+	const specs = extractPackageSpecs(snapshotSettings);
+	if (!specs.length) return [];
+	const listedSpecs = new Set(extractPackageSpecs(await localSettings(agentDir)));
+	const listedNames = new Set(
+		[...listedSpecs]
+			.map((spec) => npmPackageName(spec))
+			.filter((name): name is string => name !== undefined),
+	);
+	const missing: string[] = [];
+	for (const spec of specs) {
+		if (listedSpecs.has(spec)) continue;
+		const name = npmPackageName(spec);
+		if (!name) {
+			// A spec Pi installs elsewhere (git, local path, bare name) can only be
+			// judged by the settings list, which did not match.
+			missing.push(spec);
+			continue;
+		}
+		if (listedNames.has(name)) continue;
+		if (!(await npmPackageInstalled(agentDir, name))) missing.push(spec);
+	}
+	return missing;
+}
+
+/** Reads this machine's settings.json; an unreadable file means "nothing known". */
+async function localSettings(agentDir: string): Promise<unknown> {
+	try {
+		return JSON.parse(
+			await fs.readFile(path.join(agentDir, "settings.json"), "utf8"),
+		);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Pi installs npm packages per scope: agent-wide, and project-local. */
+async function npmPackageInstalled(
+	agentDir: string,
+	name: string,
+): Promise<boolean> {
+	for (const root of [
+		path.join(agentDir, "npm", "node_modules"),
+		path.join(process.cwd(), ".pi", "npm", "node_modules"),
+	]) {
+		if (await fileExists(path.join(root, name))) return true;
+	}
+	return false;
 }
 
 async function shouldInstallPackages(
@@ -1578,6 +1789,11 @@ export function runPiInstallWith(
 	});
 }
 
+
+/**
+ * Fetching only reads the remote, so latest is a safe default when no picker is
+ * available; an explicit id is still validated and a picker still asks.
+ */
 function parseCommandArgs(command: string, args: string[]): ParsedArgs {
 	const parsed: ParsedArgs = { positional: [] };
 	for (let index = 0; index < args.length; index += 1) {
@@ -1612,6 +1828,12 @@ function parseCommandArgs(command: string, args: string[]): ParsedArgs {
 			parsed.assumeYes = true;
 			continue;
 		}
+		if (arg === "--select") {
+			if (command !== "pull")
+				throw new Error("--select is only valid for /webdav-sync:pull");
+			parsed.select = true;
+			continue;
+		}
 		if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
 		parsed.positional.push(arg);
 	}
@@ -1629,7 +1851,14 @@ function requireNoProfileFlag(command: string, parsed: ParsedArgs): void {
 
 function normalizeCommand(
 	raw?: string,
-): "init" | "push" | "pull" | "restore" | "status" | "profiles" | "help" {
+):
+	| "init"
+	| "push"
+	| "pull"
+	| "restore"
+	| "status"
+	| "profiles"
+	| undefined {
 	const value = (raw || "").replace(/^webdav-sync:/, "").replace(/^:/, "");
 	if (value === "init") return "init";
 	if (value === "push") return "push";
@@ -1637,7 +1866,7 @@ function normalizeCommand(
 	if (value === "restore") return "restore";
 	if (value === "status") return "status";
 	if (value === "profiles") return "profiles";
-	return "help";
+	return undefined;
 }
 
 function uniqueById(items: SnapshotChoice[]): SnapshotChoice[] {
@@ -1659,17 +1888,6 @@ function ok(text: string, data?: unknown): CommandResult {
 
 function fail(text: string): CommandResult {
 	return { ok: false, text };
-}
-
-function helpText(): string {
-	return [
-		"/webdav-sync:init [https-url]",
-		"/webdav-sync:push [--profile <name> | --create-profile <name>]",
-		"/webdav-sync:pull [--profile <name>] [snapshot-id|latest]",
-		"/webdav-sync:restore [backup-id]",
-		"/webdav-sync:status [--profile <name>]",
-		"/webdav-sync:profiles [delete <name> [--yes] | rename <old> [new] | migrate [--yes]]",
-	].join("\n");
 }
 
 function splitArgs(input: string): string[] {

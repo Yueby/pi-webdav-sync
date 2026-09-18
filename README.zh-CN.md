@@ -82,7 +82,7 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
 
 - `/webdav-sync:init [https-url]` - 从模板或远程配置文本创建 `settings.webdav.json`，覆盖前会询问。
 - `/webdav-sync:push [--profile <name> | --create-profile <name>]` - 选择 profile（现有或新建），显示摘要并询问确认，然后上传 `latest.zip`、`latest.json` 和一个时间戳快照。push 会清理该 profile 下超出 `snapshotRetention`（默认 5）的旧快照，只保留最新的。取消 profile 选择、名称输入或确认都不会上传任何内容。
-- `/webdav-sync:pull [--profile <name>] [snapshot-id|latest]` - 先选 profile，再选远程快照，备份本地状态，应用远程配置，并可选择安装快照中的 package specs。取消任一选择都会直接中止，不会下载或应用任何内容；没有交互选择器时必须显式传入 `--profile` 和快照 id。
+- `/webdav-sync:pull [--profile <name>] [--select] [snapshot-id|latest]` - 先选 profile，再选远程快照，然后选应用范围：整份 profile（替换本地配置）或只应用选中的文件（`Space`/`Enter` 目录树，就地写回）。会先备份本地状态，再应用，并可选择安装快照中的 package specs。取消任一选择都会直接中止，不会下载或应用任何内容；没有交互选择器时默认应用整份，且必须显式传入 `--profile` 和快照 id。
 - `/webdav-sync:restore [backup-id]` - 恢复 `pull`/`restore` 生成的本地备份（默认最新一个）。确认后先创建一份新的安全备份，再应用选中的备份。本地备份不区分 profile。
 - `/webdav-sync:status [--profile <name>]` - 比较本地 allowlist 状态与该 profile 的远端 `latest` 快照，报告 `+/~/-` 差异。
 - `/webdav-sync:profiles [delete <name> [--yes] | rename <old> [new] | migrate [--yes]]` - 交互式管理远端 profile；以上参数供脚本使用。
@@ -93,7 +93,13 @@ WebDAV 配置文件位于 Pi 全局配置目录旁边，并且不会被同步：
 - `always` - 自动安装 packages。
 - `never` - 不安装 packages。
 
+只会提示本机**真正缺失**的包：本地 `settings.json` 里列出的（按包名比较，忽略 `npm:` 前缀与版本号）、或目录已存在于 Pi 的 `~/.pi/agent/npm/node_modules/`（或项目级 `.pi/npm/node_modules/`）的，都算已安装。所以本机都装齐时，整份拉取不会再多问一句；选择性拉取只有在选择里**包含 `settings.json`** 时才会问包安装 —— 只拉一个扩展文件永远不会弹出同步插件。
+
 ## Profile
+
+选择性拉取会先走进快照的目录树，只写你勾的东西。入口在 profile 顶层：`Space` 勾选当前高亮的文件或**整个文件夹**（不用进去），`Enter` 展开/收起文件夹（在文件上则勾选），`←`/`→` 收起/展开，`Esc` 取消，最后移到 `✓ Pull N selection(s) into the local config` 行按 `Enter` 即写回本地。树里用 `▾`/`▸` 加缩进显示层级，`✓` 标记跨层级保留。写回时会先存一份本地安全备份，只覆盖选中的文件（含 allowlist、配置的额外路径、`external-resources/`），**其余本地文件一律不动，也不会删除任何东西**。加 `--select` 可跳过 `Everything` / `Choose files…` 那一步，直接进目录树。
+
+RPC / print 模式没有自定义 TUI 组件，会退回每次只显示一层列表：`Enter` 进入文件夹，层顶的 `☑ whole directory` 行用来选中该目录下全部。
 
 profile 是相互独立的远端命名空间，因此同一台机器可以上传不同的配置，并选择拉取其中一份。它不改变本地收集哪些文件：allowlist、`extraFiles`、`extraDirs` 仍然是全局一份，所以每个 profile 包含同一批文件、只是内容不同。
 
@@ -107,7 +113,7 @@ profiles/<name>/latest.zip | latest.json      其它 profile 结构完全相同
 profiles/<name>/snapshots/<id>.zip | json
 ```
 
-`layout.json` 内容为 `{"tool":"pi-webdav-sync","layoutVersion":2}`。如果远端由更新版本写入，旧版本会直接拒绝操作，而不是去改坏它。
+`layout.json` 内容为 `{"tool":"pi-webdav-sync","layoutVersion":2}`。如果远端由更新版本写入，命令会失败并保持远端不变，因此旧客户端不会改动更新版本的远端。
 
 兼容性：该布局从 0.3.0 开始。0.2.x 客户端只认识根布局，因此把未升级的机器指向已迁移的远端会报告“没有远端快照”；共用同一远端的机器请全部升级。
 
@@ -119,8 +125,9 @@ profiles/<name>/snapshots/<id>.zip | json
 
 交互流程（TUI）：
 
-- `/webdav-sync:push` 弹出 profile 选择器，列出所有现有 profile 以及 `＋ Create profile…`；选新建会再问名字，随后确认框会写明目标 profile。任一步取消都不会上传。
-- `/webdav-sync:pull` 在存在多个 profile 时先问选哪个，再弹快照选择器；`/webdav-sync:status` 同样先问 profile。取消任一步都不会下载、备份或应用。
+- `/webdav-sync:push` 弹出 profile 选择器，列出所有现有 profile 以及 `＋ Create profile…`；上次用过的 profile 排在最前面并标为 `(current)`，直接回车就是它。选新建会再问名字，随后确认框会写明目标 profile。任一步取消都不会上传。
+- `/webdav-sync:pull` 在存在多个 profile 时先问选哪个（当前 profile 置顶），再弹快照选择器，然后问 `✓ Everything（替换本地配置）` 或 `Choose files…`（只应用选中项）；`/webdav-sync:status` 同样先问 profile。取消任一步都不会下载、备份或应用。
+- 当前 profile 按机器记在 `.webdav-sync/state.json`（就在本地备份旁边，**永远不会上传**）。记录的是**真正上传过或下载过的**那个 profile —— 只在选择器里选了却取消、或命令执行失败，都不会改动记忆。删掉它会清除记忆，重命名会让记忆跟着改名。远端只有一个 profile 时依旧什么都不问。
 - `/webdav-sync:profiles` 弹出操作菜单：`List profiles`、`Delete a profile…`、`Rename a profile…`；远端根目录还留着旧布局数据时，会多出 `Migrate legacy layout…`。删除会先问哪个 profile，再弹出删除内容预览确认；重命名先问哪个 profile，再问新名字。
 - 每一步都可以用等价参数跳过（`--profile`、`--create-profile`、`delete <name> --yes`、`rename <old> [new]`、`migrate --yes`），非交互场景就用这些。没有选择器时命令默认操作 `default`（除非传 `--profile`），且 `pull` 仍要求显式给快照 id。
 
@@ -153,7 +160,7 @@ pull 只会接受接收机器本地 `settings.webdav.json` 已授权的非内置
 - 日志文件和临时文件
 - 不跟随符号链接；被跳过的符号链接会记录为 warning
 
-被排除的条目同样不会被删除：pull 只删除它本应收集的路径，因此 `extensions/node_modules/` 这类被排除的子树不会因为父目录被移除而一起消失。
+被排除的条目同样不会被删除：pull 只删除它本应收集的路径，因此 `extensions/node_modules/` 这类被排除的子树会在 pull 后保留。
 
 `settings.json` 会经过重写步骤后再同步。本机相关配置会在同步前移除：
 
@@ -185,8 +192,4 @@ pull 只会接受接收机器本地 `settings.webdav.json` 已授权的非内置
 
 安装 packages 时以 Node 脚本方式运行 pi CLI，不经过 shell。以 `-` 开头、包含空白或控制字符、或超过 2048 字符的 spec 会被跳过并报告；确认框和进度输出中的 spec 会脱敏 URL 凭据。
 
-归档大小有上限（20000 个条目、单文件 64 MiB、总计 256 MiB、压缩后 32 MiB），创建归档时同样受限，因此 push 和 backup 会直接报错，而不会生成一个读不回来的快照；重复条目名和 manifest 哈希不匹配的内容会被拒绝；不专门支持 ZIP64 归档。
-
-## 贡献者
-
-- [oversk7](https://github.com/oversk7) — 用户可配置的同步 allowlist
+归档大小有上限（20000 个条目、单文件 64 MiB、总计 256 MiB、压缩后 32 MiB），创建归档时同样受限：超限时 push/backup 会报错并给出限制值。重复条目名和 manifest 哈希不匹配的内容会被拒绝；不专门支持 ZIP64 归档。

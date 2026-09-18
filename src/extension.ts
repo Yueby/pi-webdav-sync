@@ -1,5 +1,6 @@
 import { redactPackageSpec } from "./package-specs.js";
 import type { ProfileChoice } from "./profiles.js";
+import type { TreePickerTheme } from "./tree-picker.js";
 import {
 	runWebdavSyncCommand,
 	type InstallProgress,
@@ -67,12 +68,7 @@ export function activate(pi: PiLike): void {
 		"Compare local Pi config with a WebDAV profile",
 		"status",
 	);
-	register(
-		pi,
-		"webdav-sync:profiles",
-		"Manage WebDAV sync profiles (interactive menu)",
-		"profiles",
-	);
+	register(pi, "webdav-sync:profiles", "Manage WebDAV sync profiles (interactive menu)", "profiles");
 }
 
 function register(
@@ -149,6 +145,48 @@ function register(
 										: "lowercase letters, digits, dot, dash, underscore",
 								)) ?? undefined
 						: undefined,
+					choosePaths:
+						ctx?.ui
+							? async (profileName: string, files: string[]) => {
+									// Space selects, Enter expands/enters, Esc cancels.
+									const { createTreePickerComponent } = await import(
+										"./tree-picker.js"
+									);
+									const ui = ctx.ui as unknown as {
+										custom?: <T>(
+											factory: (
+												tui: unknown,
+												theme: unknown,
+												keybindings: unknown,
+												done: (value: T) => void,
+											) => {
+												render(width: number): string[];
+												handleInput?(data: string): void;
+												invalidate(): void;
+											},
+										) => Promise<T | undefined>;
+									};
+									if (!ui.custom) return undefined;
+									return await ui.custom<string[] | undefined>(
+										(tui, theme, _keybindings, done) => {
+											const rows = (tui as { terminal?: { rows?: number } })
+												?.terminal?.rows;
+											return createTreePickerComponent(
+												profileName,
+												files,
+												done,
+												{
+													theme: theme as TreePickerTheme,
+													height:
+														typeof rows === "number" && rows > 0
+															? rows
+															: undefined,
+												},
+											);
+										},
+									);
+								}
+							: undefined,
 					selectSnapshot: ctx?.ui?.select
 						? async (choices: SnapshotChoice[]) => {
 								const labels = choices.map((choice) => choice.label);
@@ -162,11 +200,8 @@ function register(
 					confirmInstallPackages: ctx?.ui?.confirm
 						? async (specs: string[]) =>
 								ctx.ui?.confirm?.(
-									"Install missing Pi packages?",
-									[
-										`Pull found ${specs.length} package(s) in the snapshot:`,
-										...specs.map(redactPackageSpec),
-									].join("\n"),
+									"Install Pi packages this machine is missing?",
+									formatInstallPrompt(specs),
 								) ?? false
 						: undefined,
 					onInstallProgress: (progress) =>
@@ -179,6 +214,17 @@ function register(
 			}
 		},
 	});
+}
+
+/**
+ * Body of the package confirmation: only specs that this machine is missing reach
+ * here, so the wording never claims the snapshot simply lists them.
+ */
+export function formatInstallPrompt(specs: string[]): string {
+	return [
+		`The snapshot lists ${specs.length} package(s) that are not installed here:`,
+		...specs.map(redactPackageSpec),
+	].join("\n");
 }
 
 function formatPushPreview(preview: PushPreview): string {

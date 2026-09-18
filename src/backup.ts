@@ -152,7 +152,9 @@ export async function loadBackup(
 		record,
 		archive: parseArchive(zipBytes, latest.zipSha256, pathOptions),
 	};
-}type ArchiveTarget = {
+}
+
+type ArchiveTarget = {
 	logicalPath: string;
 	absolutePath: string;
 	root: string;
@@ -350,6 +352,38 @@ async function executeRemovals(
 	}
 	await pruneEmptyDirectories(agentDir, plan.extraPaths, parents);
 	return deleted;
+}
+
+/**
+ * Writes only the selected archive entries to their local targets and removes
+ * nothing: a selective pull of individual files. Everything is validated exactly
+ * like a full apply, so allowlisted paths, external resources and symlinks keep
+ * the same rules.
+ */
+export async function applyArchivePaths(
+	agentDir: string,
+	archive: ParsedArchive,
+	paths: string[],
+	pathOptions: SyncPathOptions = {},
+): Promise<ApplySummary> {
+	const resolvedAgentDir = path.resolve(agentDir);
+	const selected = new Set(paths.map((entry) => safeRelativePath(entry)));
+	preflightArchiveTargets(resolvedAgentDir, archive, pathOptions);
+	await preflightSymlinkFreeTargets(resolvedAgentDir, archive);
+	const targets = archiveTargets(resolvedAgentDir, archive).filter((target) =>
+		selected.has(safeRelativePath(target.logicalPath)),
+	);
+	const missing = [...selected].filter(
+		(entry) => !targets.some((target) => target.logicalPath === entry),
+	);
+	if (missing.length)
+		throw new Error(`Archive is missing: ${missing.join(", ")}`);
+	const written = await writeTargets(targets);
+	return {
+		filesWritten: written.filesWritten,
+		filesDeleted: 0,
+		externalFilesWritten: written.externalFilesWritten,
+	};
 }
 
 async function writeTargets(targets: ArchiveTarget[]): Promise<{

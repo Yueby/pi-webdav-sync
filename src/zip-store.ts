@@ -93,6 +93,73 @@ function assertWithinLimits(
 		);
 }
 
+/** Every file path in an archive, normalized and sorted. */
+export function archiveFilePaths(archive: ParsedArchive): string[] {
+	return [
+		...new Set(
+			archive.manifest.files.map((file) => safeRelativePath(file.path)),
+		),
+	].sort();
+}
+
+/**
+ * How many files a path stands for: the file itself, or everything below a
+ * directory prefix.
+ */
+export function archiveFileCount(
+	archive: ParsedArchive,
+	prefix: string,
+): number {
+	const base = prefix ? `${prefix.replace(/\/+$/, "")}/` : "";
+	return archiveFilePaths(archive).filter(
+		(path) => path === prefix || (base !== "" && path.startsWith(base)),
+	).length;
+}
+
+export type ArchiveEntryInfo = {
+	path: string;
+	type: "file" | "directory";
+	/** Files below this entry; 1 for a file. */
+	files: number;
+	size?: number;
+};
+
+/** Direct children of a prefix, directories first, for the interactive picker. */
+export function archiveChildren(
+	archive: ParsedArchive,
+	prefix = "",
+): ArchiveEntryInfo[] {
+	const base = prefix ? `${prefix.replace(/\/+$/, "")}/` : "";
+	const children = new Map<string, ArchiveEntryInfo>();
+	for (const entryPath of archiveFilePaths(archive)) {
+		if (base !== "" && !entryPath.startsWith(base)) continue;
+		const rest = entryPath.slice(base.length);
+		if (!rest) continue;
+		const slash = rest.indexOf("/");
+		const name = slash === -1 ? rest : rest.slice(0, slash);
+		const childPath = `${base}${name}`;
+		const existing = children.get(childPath);
+		if (existing) {
+			existing.files += 1;
+			continue;
+		}
+		const bytes = archive.entries.get(`files/${childPath}`);
+		children.set(childPath, {
+			path: childPath,
+			type: bytes ? "file" : "directory",
+			files: 1,
+			size: bytes?.byteLength,
+		});
+	}
+	return [...children.values()].sort((a, b) =>
+		a.type === b.type
+			? a.path.localeCompare(b.path)
+			: a.type === "directory"
+				? -1
+				: 1,
+	);
+}
+
 export function listZipEntries(zipBytes: Uint8Array): string[] {
 	const unzipped = unzipSync(zipBytes);
 	return Object.keys(unzipped).map(validateZipEntryPath).sort();

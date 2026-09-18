@@ -55,6 +55,20 @@ export function withListPrefix(prefix: string, body: string): string {
 	return `${prefix}${body}`;
 }
 
+/**
+ * The npm package name inside an `npm:` spec, or undefined for specs Pi installs
+ * elsewhere (git, local paths). Version suffixes and the `!`/`+`/`-` list prefixes
+ * are stripped; names that could escape the install root are rejected.
+ */
+export function npmPackageName(spec: string): string | undefined {
+	const { body } = stripListPrefix(spec.trim());
+	if (!body.startsWith("npm:")) return undefined;
+	const match = /^(@[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*|[a-z0-9][a-z0-9._-]*)(?:@[^\s/]+)?$/i.exec(
+		body.slice(4),
+	);
+	return match ? match[1] : undefined;
+}
+
 export function extractPackageSpecs(settings: unknown): string[] {
 	if (!settings || typeof settings !== "object") return [];
 	const packages = (settings as { packages?: unknown }).packages;
@@ -107,8 +121,4 @@ export function clonePackageEntryWithSource(
 		return { ...(entry as Record<string, unknown>), source };
 	}
 	return entry;
-}
-
-export function missingInstallSpecs(settings: unknown): string[] {
-	return extractPackageSpecs(settings);
 }

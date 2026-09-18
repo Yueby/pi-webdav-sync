@@ -11,12 +11,17 @@ const distUrl = (relativePath) =>
 const { collectAgentArchive } = await import(distUrl("collector.js"));
 const { validateConfig } = await import(distUrl("config.js"));
 const { createManifest, sha256Bytes } = await import(distUrl("manifest.js"));
-const { isRemotePackageSpec } = await import(distUrl("package-specs.js"));
+const { isRemotePackageSpec, npmPackageName } = await import(
+	distUrl("package-specs.js")
+);
 const { createLatestZip, listZipEntries, parseArchive, DEFAULT_ARCHIVE_LIMITS } =
 	await import(distUrl("zip-store.js"));
 const { runWebdavSyncCommand, pruneRemoteSnapshots, resolvePiInvocation, runPiInstallWith } =
 	await import(distUrl("commands.js"));
-const { formatInstallProgress } = await import(distUrl("extension.js"));
+const { selectArchivePaths } = await import(distUrl("path-select.js"));
+const { formatInstallProgress, formatInstallPrompt } = await import(
+	distUrl("extension.js")
+);
 const { scopedBackend } = await import(distUrl("backends/scoped.js"));
 const { applyArchiveToAgent, applyArchiveWithRollback, createLocalBackup } =
 	await import(distUrl("backup.js"));
@@ -356,6 +361,31 @@ try {
 	assert(
 		!isRemotePackageSpec("./local-package"),
 		"relative paths should not be remote package specs",
+	);
+	assert.equal(
+		npmPackageName("npm:@scope/pkg@1.2.3"),
+		"@scope/pkg",
+		"a scoped spec keeps its scope and drops the version",
+	);
+	assert.equal(
+		npmPackageName("+npm:pi-web-access"),
+		"pi-web-access",
+		"list prefixes do not hide the package name",
+	);
+	assert.equal(
+		npmPackageName("git:github.com/user/repo"),
+		undefined,
+		"specs Pi installs elsewhere have no npm name",
+	);
+	assert.equal(
+		npmPackageName("npm:../../etc/passwd"),
+		undefined,
+		"a name that could escape the install root is rejected",
+	);
+	assert.match(
+		formatInstallPrompt(["npm:pi-truly-missing"]),
+		/not installed here/,
+		"the confirmation says these packages are missing, not merely listed",
 	);
 	assert(
 		collected.manifest.packageSpecs.includes("pi-skills"),
@@ -1411,6 +1441,155 @@ try {
 		"package installs must never spawn through a shell",
 	);
 
+	// --- Only packages this machine is missing are offered ---------------------
+	// The snapshot lists five specs; only the last one is absent from this machine.
+	const packagesAgent = path.join(tempRoot, "packages-agent");
+	await fs.mkdir(packagesAgent, { recursive: true });
+	await fs.writeFile(path.join(packagesAgent, "AGENTS.md"), "packages agent\n");
+	await fs.writeFile(
+		path.join(packagesAgent, "settings.json"),
+		`${JSON.stringify(
+			{
+				packages: [
+					"npm:pi-web-access",
+					"npm:pi-subagents",
+					"npm:@juicesharp/rpiv-todo",
+					"npm:pi-goal-x",
+					"npm:pi-truly-missing",
+				],
+			},
+			null,
+			2,
+		)}
+`,
+	);
+	await writeTestConfig(packagesAgent);
+	const packagesBackend = new MemoryBackend();
+	await runWebdavSyncCommand(["push"], {
+		agentDir: packagesAgent,
+		backend: packagesBackend,
+		confirmPush: async () => true,
+	});
+	// Two ways a machine already has a package: its settings list (here with a
+	// version suffix, so the name has to be compared, not the raw string), or the
+	// package directory under Pi's npm install root (one scoped, one plain).
+	const seedPackagesTarget = async (dir) => {
+		await fs.mkdir(
+			path.join(dir, "npm", "node_modules", "@juicesharp", "rpiv-todo"),
+			{ recursive: true },
+		);
+		await fs.mkdir(path.join(dir, "npm", "node_modules", "pi-goal-x"), {
+			recursive: true,
+		});
+		await fs.writeFile(
+			path.join(dir, "settings.json"),
+			`${JSON.stringify(
+				{ packages: ["npm:pi-web-access", "npm:pi-subagents@1.2.3"] },
+				null,
+				2,
+			)}
+`,
+		);
+		await writeTestConfig(dir);
+	};
+
+	const everythingTarget = path.join(tempRoot, "packages-everything");
+	await fs.mkdir(everythingTarget, { recursive: true });
+	await seedPackagesTarget(everythingTarget);
+	let askedForEverything = "unset";
+	const installedEverything = [];
+	const everythingPull = await runWebdavSyncCommand(["pull", "latest"], {
+		agentDir: everythingTarget,
+		backend: packagesBackend,
+		confirmInstallPackages: async (specs) => {
+			askedForEverything = specs;
+			return true;
+		},
+		installPackage: async (spec) => {
+			installedEverything.push(spec);
+			return 0;
+		},
+	});
+	assert.equal(
+		everythingPull.ok,
+		true,
+		`full pull with installed packages: ${everythingPull.text}`,
+	);
+	assert.deepEqual(
+		askedForEverything,
+		["npm:pi-truly-missing"],
+		"only packages this machine lacks are offered",
+	);
+	assert.deepEqual(
+		installedEverything,
+		["npm:pi-truly-missing"],
+		"only the missing package reaches the installer",
+	);
+
+	// A selective pull that does not take settings.json must not ask at all: the
+	// machine's own configuration is not touched by it.
+	const selectionTarget = path.join(tempRoot, "packages-selection");
+	await fs.mkdir(selectionTarget, { recursive: true });
+	await seedPackagesTarget(selectionTarget);
+	let askedForSelection = "unset";
+	const selectiveWithoutSettings = await runWebdavSyncCommand(
+		["pull", "--select", "latest"],
+		{
+			agentDir: selectionTarget,
+			backend: packagesBackend,
+			choosePaths: async (_profile, files) =>
+				files.filter((file) => file === "AGENTS.md"),
+			confirmInstallPackages: async (specs) => {
+				askedForSelection = specs;
+				return false;
+			},
+		},
+	);
+	assert.equal(
+		selectiveWithoutSettings.ok,
+		true,
+		`selective pull without settings.json: ${selectiveWithoutSettings.text}`,
+	);
+	assert.match(
+		selectiveWithoutSettings.text,
+		/mode: selected \(1 file\(s\)\)/,
+		"the selective pull applies exactly what was picked",
+	);
+	assert.equal(
+		askedForSelection,
+		"unset",
+		"a selection without settings.json never asks about packages",
+	);
+	assert(
+		!/^packages:/m.test(selectiveWithoutSettings.text),
+		"a selection without settings.json reports no packages",
+	);
+
+	let askedWithSettings = "unset";
+	const selectiveWithSettings = await runWebdavSyncCommand(
+		["pull", "--select", "latest"],
+		{
+			agentDir: selectionTarget,
+			backend: packagesBackend,
+			choosePaths: async (_profile, files) =>
+				files.filter((file) => file === "settings.json"),
+			confirmInstallPackages: async (specs) => {
+				askedWithSettings = specs;
+				return false;
+			},
+		},
+	);
+	assert.equal(
+		selectiveWithSettings.ok,
+		true,
+		`selective pull with settings.json: ${selectiveWithSettings.text}`,
+	);
+	assert.deepEqual(
+		askedWithSettings,
+		["npm:pi-truly-missing"],
+		"taking settings.json in a selection offers the missing packages",
+	);
+
 	// --- Rollback of a failed apply ------------------------------------------
 	const rollbackAgent = path.join(tempRoot, "rollback-agent");
 	// An excluded (never collected) file keeps this directory non-empty, so the
@@ -2278,7 +2457,9 @@ try {
 	const workPull = await runWebdavSyncCommand(["pull"], {
 		agentDir: workTarget,
 		backend: sharedBackend,
-		selectProfile: async (choices) => {
+		selectProfile: async (choices, message) => {
+			// The pull scope question comes with its own message; answer "everything".
+			if (message !== undefined) return choices[0]?.id;
 			profilePickerChoices = choices.map((choice) => choice.id);
 			return "work";
 		},
@@ -2296,6 +2477,247 @@ try {
 		await fs.readFile(path.join(workTarget, "AGENTS.md"), "utf8"),
 		"work profile content v2\n",
 		"pull should apply the selected profile content",
+	);
+
+	// --- remembered profile: pinned first, one Enter repeats it ----------------
+	const memoryAgent = path.join(tempRoot, "profile-memory");
+	await fs.mkdir(memoryAgent, { recursive: true });
+	await writeTestConfig(memoryAgent);
+	const memoryState = path.join(memoryAgent, ".webdav-sync", "state.json");
+	assert.equal(
+		await exists(memoryState),
+		false,
+		"a fresh agent directory remembers no profile",
+	);
+
+	let firstRunChoices;
+	const memoryFirstPull = await runWebdavSyncCommand(["pull"], {
+		agentDir: memoryAgent,
+		backend: sharedBackend,
+		selectProfile: async (choices, message) => {
+			if (message !== undefined) return choices[0]?.id; // the pull scope question
+			firstRunChoices = choices.map((choice) => choice.id);
+			return choices.find((choice) => choice.id === "work")?.id;
+		},
+		selectSnapshot: async () => "latest",
+	});
+	assert.equal(
+		memoryFirstPull.ok,
+		true,
+		`first remembered pull: ${memoryFirstPull.text}`,
+	);
+	assert.deepEqual(
+		firstRunChoices,
+		["default", "work"],
+		"without a memory the picker keeps the plain order",
+	);
+	assert.equal(
+		JSON.parse(await fs.readFile(memoryState, "utf8")).currentProfile,
+		"work",
+		"the picked profile is remembered",
+	);
+
+	let secondRunChoices;
+	let secondRunLabels;
+	let answeredFirst;
+	const memorySecondPull = await runWebdavSyncCommand(["pull"], {
+		agentDir: memoryAgent,
+		backend: sharedBackend,
+		selectProfile: async (choices, message) => {
+			if (message !== undefined) return choices[0]?.id;
+			secondRunChoices = choices.map((choice) => choice.id);
+			secondRunLabels = choices.map((choice) => choice.label);
+			answeredFirst = choices[0]?.id; // what pressing Enter takes
+			return choices[0]?.id;
+		},
+		selectSnapshot: async () => "latest",
+	});
+	assert.equal(
+		memorySecondPull.ok,
+		true,
+		`second remembered pull: ${memorySecondPull.text}`,
+	);
+	assert.deepEqual(
+		secondRunChoices,
+		["work", "default"],
+		"the remembered profile is pinned first",
+	);
+	assert(
+		secondRunLabels[0].startsWith("work ") &&
+			secondRunLabels[0].endsWith("(current)"),
+		`the pinned row is marked as current: ${secondRunLabels[0]}`,
+	);
+	assert.equal(answeredFirst, "work", "the first row is the remembered profile");
+	assert.match(
+		memorySecondPull.text,
+		/profile: work/,
+		"one Enter repeats the remembered profile",
+	);
+
+	// push offers the same order, and still offers creating a profile last
+	let pushChoices;
+	const memoryPush = await runWebdavSyncCommand(["push"], {
+		agentDir: memoryAgent,
+		backend: sharedBackend,
+		confirmPush: async () => true,
+		selectProfile: async (choices) => {
+			pushChoices = choices.map((choice) => choice.id);
+			return choices[0]?.id;
+		},
+	});
+	assert.equal(memoryPush.ok, true, `remembered push: ${memoryPush.text}`);
+	assert.deepEqual(
+		pushChoices,
+		["work", "default", "__new__"],
+		"push pins the remembered profile first and keeps the create row last",
+	);
+	assert.match(memoryPush.text, /profile: work/, "one Enter pushes to the remembered profile");
+
+	// selecting a profile is not using it: an aborted or failed command must leave
+	// the memory exactly as it was
+	const cancelledPushMemory = await runWebdavSyncCommand(["push"], {
+		agentDir: memoryAgent,
+		backend: sharedBackend,
+		confirmPush: async () => false,
+		selectProfile: async (choices) =>
+			choices.find((choice) => choice.id === "default")?.id,
+	});
+	assert.equal(cancelledPushMemory.ok, true, `cancelled push: ${cancelledPushMemory.text}`);
+	assert.equal(
+		JSON.parse(await fs.readFile(memoryState, "utf8")).currentProfile,
+		"work",
+		"a push cancelled at the confirmation keeps the previous profile",
+	);
+
+	const cancelledPullMemory = await runWebdavSyncCommand(["pull"], {
+		agentDir: memoryAgent,
+		backend: sharedBackend,
+		selectProfile: async (choices, message) =>
+			message !== undefined
+				? undefined // cancel the scope question
+				: choices.find((choice) => choice.id === "default")?.id,
+		selectSnapshot: async () => "latest",
+	});
+	assert.equal(cancelledPullMemory.ok, true, `cancelled pull: ${cancelledPullMemory.text}`);
+	assert.match(cancelledPullMemory.text, /nothing was downloaded/, "the cancelled pull says so");
+	assert.equal(
+		JSON.parse(await fs.readFile(memoryState, "utf8")).currentProfile,
+		"work",
+		"a pull cancelled before applying keeps the previous profile",
+	);
+
+	const failedPull = await runWebdavSyncCommand(
+		["pull", "--profile", "default", "1999-01-01T00-00-00-000Z"],
+		{ agentDir: memoryAgent, backend: sharedBackend },
+	);
+	assert.equal(failedPull.ok, false, `unknown snapshot: ${failedPull.text}`);
+	assert.equal(
+		JSON.parse(await fs.readFile(memoryState, "utf8")).currentProfile,
+		"work",
+		"a failed pull keeps the previous profile",
+	);
+
+	// an explicit flag is a choice too, so it becomes the remembered profile
+	const switched = await runWebdavSyncCommand(
+		["pull", "--profile", "default", "latest"],
+		{ agentDir: memoryAgent, backend: sharedBackend },
+	);
+	assert.equal(switched.ok, true, `explicit profile pull: ${switched.text}`);
+	assert.equal(
+		JSON.parse(await fs.readFile(memoryState, "utf8")).currentProfile,
+		"default",
+		"--profile becomes the remembered profile",
+	);
+
+	// a profile that is gone from the remote is simply not pinned
+	await fs.writeFile(
+		memoryState,
+		`${JSON.stringify({ currentProfile: "deleted-elsewhere" }, null, 2)}\n`,
+	);
+	let staleChoices;
+	const stalePull = await runWebdavSyncCommand(["pull"], {
+		agentDir: memoryAgent,
+		backend: sharedBackend,
+		selectProfile: async (choices, message) => {
+			if (message !== undefined) return choices[0]?.id;
+			staleChoices = choices.map((choice) => choice.id);
+			return choices.find((choice) => choice.id === "work")?.id;
+		},
+		selectSnapshot: async () => "latest",
+	});
+	assert.equal(stalePull.ok, true, `stale memory pull: ${stalePull.text}`);
+	assert.deepEqual(
+		staleChoices,
+		["default", "work"],
+		"a profile that no longer exists is not pinned",
+	);
+
+	// a damaged memory file never blocks a command
+	await fs.writeFile(memoryState, "{ not json");
+	const corruptPull = await runWebdavSyncCommand(
+		["pull", "--profile", "work", "latest"],
+		{ agentDir: memoryAgent, backend: sharedBackend },
+	);
+	assert.equal(corruptPull.ok, true, `corrupt memory pull: ${corruptPull.text}`);
+	assert.equal(
+		JSON.parse(await fs.readFile(memoryState, "utf8")).currentProfile,
+		"work",
+		"a damaged memory file is rewritten instead of blocking the pull",
+	);
+
+	// deleting or renaming the remembered profile keeps the memory honest
+	const bookkeepingAgent = path.join(tempRoot, "profile-bookkeeping");
+	await fs.mkdir(bookkeepingAgent, { recursive: true });
+	await writeTestConfig(bookkeepingAgent);
+	const bookkeepingBackend = new MemoryBackend();
+	for (const name of ["alpha", "beta"]) {
+		const created = await runWebdavSyncCommand(
+			["push", "--create-profile", name],
+			{
+				agentDir: bookkeepingAgent,
+				backend: bookkeepingBackend,
+				confirmPush: async () => true,
+			},
+		);
+		assert.equal(created.ok, true, `create ${name}: ${created.text}`);
+	}
+	const bookkeepingState = path.join(
+		bookkeepingAgent,
+		".webdav-sync",
+		"state.json",
+	);
+	assert.equal(
+		JSON.parse(await fs.readFile(bookkeepingState, "utf8")).currentProfile,
+		"beta",
+		"creating a profile remembers it",
+	);
+	assert(
+		listZipEntries(
+			Buffer.from(bookkeepingBackend.files.get("profiles/alpha/latest.zip")),
+		).every((entry) => !entry.startsWith(".webdav-sync")),
+		"the machine-local memory is never part of a snapshot",
+	);
+
+	const renameBookkeeping = await runWebdavSyncCommand(
+		["profiles", "rename", "beta", "gamma"],
+		{ agentDir: bookkeepingAgent, backend: bookkeepingBackend },
+	);
+	assert.equal(renameBookkeeping.ok, true, `rename: ${renameBookkeeping.text}`);
+	assert.equal(
+		JSON.parse(await fs.readFile(bookkeepingState, "utf8")).currentProfile,
+		"gamma",
+		"renaming the remembered profile makes the memory follow",
+	);
+
+	const deleteBookkeeping = await runWebdavSyncCommand(
+		["profiles", "delete", "gamma", "--yes"],
+		{ agentDir: bookkeepingAgent, backend: bookkeepingBackend },
+	);
+	assert.equal(deleteBookkeeping.ok, true, `delete: ${deleteBookkeeping.text}`);
+	assert.equal(
+		JSON.parse(await fs.readFile(bookkeepingState, "utf8")).currentProfile ?? null,
+		null,
+		"deleting the remembered profile forgets it",
 	);
 
 	const defaultTarget = path.join(tempRoot, "profile-default-target");
@@ -2594,6 +3016,8 @@ try {
 			["init", "https://example.invalid/pi.txt", "extra"],
 			/at most one remote config URL/,
 		],
+		[["nope"], /Unknown command: nope; available: init, push, pull, restore, status, profiles/],
+		[["webdav-sync:pull-extra"], /Unknown command/],
 	];
 	for (const [input, pattern] of argumentErrors) {
 		const result = await runWebdavSyncCommand(input, {
@@ -2865,7 +3289,9 @@ try {
 	const solePull = await runWebdavSyncCommand(["pull", "latest"], {
 		agentDir: soleTarget,
 		backend: workOnlyBackend,
-		selectProfile: async () => {
+		selectProfile: async (choices, message) => {
+			// The scope question may still be asked; the profile picker may not.
+			if (message !== undefined) return choices[0]?.id;
 			solePickerCalled = true;
 			return undefined;
 		},
@@ -4379,6 +4805,484 @@ try {
 			`future layout version message for ${input.join(" ")}`,
 		);
 	}
+
+	// --- selective pull: a source profile to pick from ------------------------
+	const selectiveAgent = path.join(tempRoot, "pull-agent");
+	await fs.mkdir(path.join(selectiveAgent, "extensions", "my-plugin"), {
+		recursive: true,
+	});
+	await fs.mkdir(path.join(selectiveAgent, "skills", "alpha"), { recursive: true });
+	await fs.writeFile(
+		path.join(selectiveAgent, "settings.json"),
+		`${JSON.stringify({ packages: [] }, null, 2)}\n`,
+	);
+	await fs.writeFile(path.join(selectiveAgent, "AGENTS.md"), "pull rules\n");
+	await fs.writeFile(
+		path.join(selectiveAgent, "extensions", "my-plugin", "index.js"),
+		"plugin entry\n",
+	);
+	await fs.writeFile(
+		path.join(selectiveAgent, "extensions", "my-plugin", "helper.js"),
+		"plugin helper\n",
+	);
+	await fs.writeFile(
+		path.join(selectiveAgent, "skills", "alpha", "SKILL.md"),
+		"alpha skill\n",
+	);
+	await writeTestConfig(selectiveAgent);
+	const selectiveBackend = new MemoryBackend();
+	const sourcePush = await runWebdavSyncCommand(
+		["push", "--create-profile", "source"],
+		{ agentDir: selectiveAgent, backend: selectiveBackend, confirmPush: async () => true },
+	);
+	assert.equal(sourcePush.ok, true, `source profile push: ${sourcePush.text}`);
+
+	// --- selective pull: scope question, tree picker, --select --------------
+	await fs.writeFile(path.join(selectiveAgent, "AGENTS.md"), "target rules\n");
+	await fs.writeFile(
+		path.join(selectiveAgent, "extensions", "my-plugin", "index.js"),
+		"target plugin\n",
+	);
+	await fs.writeFile(
+		path.join(selectiveAgent, "extensions", "my-plugin", "helper.js"),
+		"target helper\n",
+	);
+	const pullScript = ["extensions", "extensions/my-plugin", "index.js", "done"];
+	let pullStep = 0;
+	let scopeChoices;
+	const pullMessages = [];
+	const selectivePull = await runWebdavSyncCommand(
+		["pull", "--profile", "source", "latest"],
+		{
+			agentDir: selectiveAgent,
+			backend: selectiveBackend,
+			selectProfile: async (choices, message) => {
+				pullMessages.push(message ?? "(no message)");
+				if ((message ?? "").includes("what should be applied")) {
+					scopeChoices = choices.map((choice) => choice.label);
+					return choices.find((choice) =>
+						choice.label.includes("Choose files"),
+					)?.id;
+				}
+				const wanted = pullScript[pullStep];
+				pullStep += 1;
+				if (wanted === "done")
+					return choices.find((choice) => choice.label.startsWith("✓ Pull"))?.id;
+				const exact = choices.find((choice) => choice.id === wanted);
+				if (exact) return exact.id;
+				const row =
+					choices.find(
+						(choice) =>
+							(choice.label.startsWith("📁") ||
+								choice.label.startsWith("📄")) &&
+							choice.label.includes(`${wanted}/`),
+					) ?? choices.find((choice) => choice.label.includes(wanted));
+				return row?.id;
+			},
+		},
+	);
+	assert.equal(selectivePull.ok, true, `selective pull: ${selectivePull.text}`);
+	assert.match(
+		selectivePull.text,
+		/mode: selected \(1 file\(s\)\)/,
+		`the pull reports the selection; prompts: ${pullMessages.join(" || ")}`,
+	);
+	assert.match(selectivePull.text, /backup: /, "a selective pull still keeps a safety backup");
+	assert.equal(
+		await fs.readFile(
+			path.join(selectiveAgent, "extensions", "my-plugin", "index.js"),
+			"utf8",
+		),
+		"plugin entry\n",
+		"the selected file is pulled from the profile",
+	);
+	assert.equal(
+		await fs.readFile(
+			path.join(selectiveAgent, "extensions", "my-plugin", "helper.js"),
+			"utf8",
+		),
+		"target helper\n",
+		"unselected files stay untouched",
+	);
+	assert.equal(
+		await fs.readFile(path.join(selectiveAgent, "AGENTS.md"), "utf8"),
+		"target rules\n",
+		"a selective pull never replaces the rest of the config",
+	);
+	assert.deepEqual(
+		scopeChoices?.map((label) => label.slice(0, 12)),
+		["✓ Everything", "Choose files"],
+		"the scope question offers everything and a selection",
+	);
+
+	// the default path is still a full replace
+	const fullPull = await runWebdavSyncCommand(
+		["pull", "--profile", "source", "latest"],
+		{
+			agentDir: selectiveAgent,
+			backend: selectiveBackend,
+			selectProfile: async (choices, message) =>
+				(message ?? "").includes("what should be applied")
+					? choices[0]?.id
+					: undefined,
+		},
+	);
+	assert.match(fullPull.text, /mode: everything/, "choosing Everything applies the profile");
+	assert.equal(
+		await fs.readFile(path.join(selectiveAgent, "AGENTS.md"), "utf8"),
+		"pull rules\n",
+		"a full pull replaces the local config",
+	);
+
+	// --select skips the question and goes straight to the tree
+	let scopeAsked = false;
+	let selectStep = 0;
+	const selectPull = await runWebdavSyncCommand(
+		["pull", "--select", "--profile", "source", "latest"],
+		{
+			agentDir: selectiveAgent,
+			backend: selectiveBackend,
+			selectProfile: async (choices, message) => {
+				if ((message ?? "").includes("what should be applied")) {
+					scopeAsked = true;
+					return choices[0]?.id;
+				}
+				selectStep += 1;
+				if (selectStep === 1)
+					return choices.find((choice) => choice.id === "extensions")?.id;
+				if (selectStep === 2)
+					return choices.find((choice) =>
+						choice.label.includes("whole directory"),
+					)?.id;
+				return choices.find((choice) => choice.label.startsWith("✓ Pull"))?.id;
+			},
+		},
+	);
+	assert.equal(scopeAsked, false, "--select skips the scope question");
+	assert.match(selectPull.text, /mode: selected/, "--select applies only the selection");
+
+	// without a terminal the walk cannot run, and nothing is applied
+	const noPicker = await runWebdavSyncCommand(
+		["pull", "--select", "--profile", "source", "latest"],
+		{ agentDir: selectiveAgent, backend: selectiveBackend },
+	);
+	assert.equal(noPicker.ok, false, "--select needs a picker");
+	assert.match(
+		noPicker.text,
+		/No picker is available/,
+		`the reason is reported: ${noPicker.text}`,
+	);
+	assert.equal(
+		await fs.readFile(path.join(selectiveAgent, "AGENTS.md"), "utf8"),
+		"pull rules\n",
+		"a failed selection changes nothing locally",
+	);
+
+
+	// --- path selection: exact files, directory prefixes, literal star names ---
+	const fakeArchive = {
+		entries: new Map(),
+		manifest: {
+			files: [
+				{ path: "AGENTS.md" },
+				{ path: "a*b.txt" },
+				{ path: "aXb.txt" },
+				{ path: "extensions/plug/index.js" },
+				{ path: "extensions/plug/helper.js" },
+			],
+		},
+	};
+	assert.deepEqual(
+		selectArchivePaths(fakeArchive, ["a*b.txt"]),
+		["a*b.txt"],
+		"a picked name keeps a literal star instead of matching siblings",
+	);
+	assert.deepEqual(
+		selectArchivePaths(fakeArchive, ["extensions/plug"]),
+		["extensions/plug/helper.js", "extensions/plug/index.js"],
+		"a picked directory stands for everything below it",
+	);
+	assert.deepEqual(
+		selectArchivePaths(fakeArchive, ["AGENTS.md", "AGENTS.md", "./AGENTS.md"]),
+		["AGENTS.md"],
+		"repeated picks collapse into one path",
+	);
+	assert.throws(
+		() => selectArchivePaths(fakeArchive, ["extensions/nope"]),
+		/No files matched/,
+		"a pick that is not in the archive is reported",
+	);
+	assert.throws(
+		() => selectArchivePaths(fakeArchive, []),
+		/No paths selected/,
+		"an empty pick is reported",
+	);
+
+	// --- tree picker: Space selects, Enter expands, Esc cancels -------------
+	const {
+		createTreePickerState,
+		treePickerRows,
+		treePickerSelection,
+		reduceTreePicker,
+		pickerActionFor,
+		createTreePickerComponent,
+		DONE_PATH,
+		visibleWidth,
+		truncateToWidth,
+		stripAnsi,
+	} = await import(distUrl("tree-picker.js"));
+	const pickerFiles = [
+		"AGENTS.md",
+		"extensions/plug/index.js",
+		"extensions/plug/helper.js",
+		"skills/alpha/SKILL.md",
+	];
+
+	// top level starts expanded, directories first, folders marked ▾/▸
+	const picker = createTreePickerState(pickerFiles);
+	assert.deepEqual(
+		treePickerRows(picker).map((row) => row.path),
+		["extensions", "extensions/plug", "skills", "skills/alpha", "AGENTS.md"],
+		"the tree opens with the first level expanded",
+	);
+	const firstRow = treePickerRows(picker)[0];
+	assert.equal(firstRow.type, "directory", "the first row is the folder");
+	assert.equal(firstRow.name, "extensions", "the row carries the folder name");
+	assert.equal(firstRow.files, 2, "the folder row counts the files below it");
+	assert.equal(firstRow.depth, 0, "top-level rows sit at depth zero");
+
+	// Space selects a folder without entering it, and keeps the highlight on it
+	assert.equal(reduceTreePicker(picker, "space"), "changed", "space is handled");
+	assert.deepEqual(
+		treePickerSelection(picker),
+		["extensions"],
+		"space selects the whole folder",
+	);
+	assert.equal(
+		treePickerRows(picker)[picker.index].path,
+		"extensions",
+		"the highlight stays on the folder that was toggled",
+	);
+	assert.equal(
+		treePickerRows(picker).at(-1).path,
+		DONE_PATH,
+		"a Done row appears at the end once something is selected",
+	);
+
+	// Enter expands a collapsed folder, and collapsing again hides its children
+	const expander = createTreePickerState(pickerFiles);
+	expander.index = 1;
+	assert.equal(reduceTreePicker(expander, "enter"), "changed", "enter is handled");
+	assert(
+		treePickerRows(expander).some(
+			(row) => row.path === "extensions/plug/index.js",
+		),
+		"enter expands the folder in place",
+	);
+	assert.equal(
+		treePickerRows(expander)[expander.index].path,
+		"extensions/plug",
+		"the highlight stays on the expanded folder",
+	);
+	assert.equal(reduceTreePicker(expander, "enter"), "changed", "enter toggles again");
+	assert.equal(
+		treePickerRows(expander).some(
+			(row) => row.path === "extensions/plug/index.js",
+		),
+		false,
+		"a second enter collapses the folder",
+	);
+
+	// Space on a file, then collapsing the parent keeps the selection
+	const filePicker = createTreePickerState(pickerFiles);
+	filePicker.index = 1;
+	reduceTreePicker(filePicker, "enter");
+	const fileRow = treePickerRows(filePicker).findIndex(
+		(row) => row.path === "extensions/plug/helper.js",
+	);
+	filePicker.index = fileRow;
+	assert.equal(reduceTreePicker(filePicker, "space"), "changed", "space selects a file");
+	assert.equal(
+		reduceTreePicker(filePicker, "left"),
+		"changed",
+		"left collapses the parent folder",
+	);
+	assert.deepEqual(
+		treePickerSelection(filePicker),
+		["extensions/plug/helper.js"],
+		"the selection survives collapsing",
+	);
+	assert.equal(
+		treePickerRows(filePicker)[filePicker.index].path,
+		"extensions/plug",
+		"the highlight returns to the parent row",
+	);
+
+	// the Done row finishes, Esc cancels
+	const donePicker = createTreePickerState(pickerFiles);
+	reduceTreePicker(donePicker, "space");
+	donePicker.index = treePickerRows(donePicker).length - 1;
+	assert.equal(reduceTreePicker(donePicker, "enter"), "done", "Done finishes the walk");
+	assert.equal(
+		reduceTreePicker(createTreePickerState(pickerFiles), "cancel"),
+		"cancel",
+		"cancel is reported",
+	);
+
+	// raw key mapping
+	assert.equal(pickerActionFor(" "), "space", "space is mapped");
+	assert.equal(pickerActionFor("\r"), "enter", "carriage return is enter");
+	assert.equal(pickerActionFor("\x1b[A"), "up", "up arrow is mapped");
+	assert.equal(pickerActionFor("\x1b[B"), "down", "down arrow is mapped");
+	assert.equal(pickerActionFor("\x1b[D"), "left", "left arrow is mapped");
+	assert.equal(pickerActionFor("\x1b"), "cancel", "escape cancels");
+	assert.equal(pickerActionFor("x"), undefined, "unrelated keys are ignored");
+
+	// the component renders within bounds and returns the selection through done()
+	let componentResult = "unset";
+	const component = createTreePickerComponent("work", pickerFiles, (value) => {
+		componentResult = value;
+	});
+	const rendered = component.render(60);
+	assert(
+		rendered.every((line) => line.length <= 60),
+		"rendered lines stay within the requested width",
+	);
+	assert.match(rendered[0], /Pull from work/, "the component shows the profile name");
+	component.handleInput(" ");
+	component.handleInput("\x1b[B");
+	component.handleInput("\x1b");
+	assert.equal(componentResult, undefined, "escape returns undefined");
+	let componentSelection = "unset";
+	const component2 = createTreePickerComponent("work", pickerFiles, (value) => {
+		componentSelection = value;
+	});
+	component2.handleInput(" ");
+	component2.handleInput("\x1b[A");
+	component2.handleInput("\r");
+	assert.deepEqual(
+		componentSelection,
+		["extensions"],
+		"the Done row returns the selection",
+	);
+
+	// --- picker rendering: ANSI-safe truncation, highlight bar, viewport -------
+	assert.equal(
+		visibleWidth("\x1b[36mabc\x1b[0m"),
+		3,
+		"escape sequences take no columns",
+	);
+	assert.equal(visibleWidth("中文"), 4, "wide characters take two columns");
+	assert.equal(
+		visibleWidth("❯ ▾ ▸ ✓"),
+		7,
+		"arrows and box drawing take one column each",
+	);
+	assert.equal(
+		truncateToWidth("abcdefghij", 5),
+		"abcd…",
+		"the ellipsis stays inside the width budget",
+	);
+	const truncatedColored = truncateToWidth(
+		`\x1b[38;5;80m${"x".repeat(40)}\x1b[39m`,
+		20,
+	);
+	assert.equal(
+		visibleWidth(truncatedColored),
+		20,
+		"a truncated colored string fits its budget",
+	);
+	assert(
+		!(/\x1b\[[0-9;]*$/).test(
+			truncateToWidth(`\x1b[38;5;80m${"x".repeat(40)}`, 20),
+		),
+		"truncation never leaves a dangling escape sequence",
+	);
+
+	const stubTheme = {
+		fg: (color, text) =>
+			`\x1b[38;5;${color === "accent" ? 80 : color === "success" ? 78 : 245}m${text}\x1b[39m`,
+		bg: (color, text) =>
+			`\x1b[48;5;${color === "selectedBg" ? 236 : 232}m${text}\x1b[49m`,
+		bold: (text) => `\x1b[1m${text}\x1b[22m`,
+	};
+	const themed = createTreePickerComponent("work", pickerFiles, () => {}, {
+		theme: stubTheme,
+		height: 12,
+	});
+	const themedLines = themed.render(40);
+	assert(
+		themedLines.every((line) => visibleWidth(line) <= 40),
+		"every themed line fits the requested width",
+	);
+	const themedHighlight = themedLines.find((line) =>
+		stripAnsi(line).includes("❯"),
+	);
+	assert(
+		themedHighlight?.includes("\x1b[48;5;236m"),
+		"the highlighted row is painted with the selected background",
+	);
+	assert.equal(
+		visibleWidth(themedHighlight),
+		40,
+		"the highlight bar spans the full width",
+	);
+
+	// a highlighted row too long for the terminal keeps its background when cut
+	const narrow = createTreePickerComponent(
+		"work",
+		["an-extremely-long-file-name-that-will-not-fit-anywhere.ts"],
+		() => {},
+		{ theme: stubTheme },
+	);
+	narrow.handleInput(" ");
+	const narrowHighlight = narrow
+		.render(24)
+		.find((line) => stripAnsi(line).includes("❯"));
+	assert.equal(
+		visibleWidth(narrowHighlight),
+		24,
+		"a truncated highlight row still spans the width",
+	);
+	assert(
+		!narrowHighlight.includes("\x1b[0m"),
+		"truncation keeps the highlight background instead of resetting it",
+	);
+	assert(
+		stripAnsi(narrowHighlight).includes("…"),
+		"the cut is marked with an ellipsis",
+	);
+
+	// a longer-than-viewport tree scrolls, always keeping the highlight visible
+	const manyFiles = Array.from(
+		{ length: 40 },
+		(_, index) => `file-${String(index + 1).padStart(2, "0")}.md`,
+	);
+	const scroller = createTreePickerComponent("work", manyFiles, () => {}, {
+		theme: stubTheme,
+		height: 12,
+	});
+	scroller.handleInput(" ");
+	let sawAbove = false;
+	let sawBelow = false;
+	for (let step = 0; step < 45; step += 1) {
+		const lines = scroller.render(48);
+		assert(
+			lines.every((line) => visibleWidth(line) <= 48),
+			"windowed lines stay within the width",
+		);
+		assert(
+			lines.some((line) => /^\s*❯/.test(stripAnsi(line))),
+			`the highlighted row stays inside the viewport (step ${step})`,
+		);
+		if (lines.some((line) => stripAnsi(line).includes("▲"))) sawAbove = true;
+		if (lines.some((line) => stripAnsi(line).includes("▼"))) sawBelow = true;
+		scroller.handleInput("\x1b[B");
+	}
+	assert(
+		sawAbove && sawBelow,
+		"a list longer than the viewport shows both scroll indicators",
+	);
 
 	console.log("self-test passed");
 } finally {
