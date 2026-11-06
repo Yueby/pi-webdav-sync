@@ -365,6 +365,7 @@ export async function applyArchivePaths(
 	archive: ParsedArchive,
 	paths: string[],
 	pathOptions: SyncPathOptions = {},
+	recoverOnFailure = false,
 ): Promise<ApplySummary> {
 	const resolvedAgentDir = path.resolve(agentDir);
 	const selected = new Set(paths.map((entry) => safeRelativePath(entry)));
@@ -378,12 +379,60 @@ export async function applyArchivePaths(
 	);
 	if (missing.length)
 		throw new Error(`Archive is missing: ${missing.join(", ")}`);
-	const written = await writeTargets(targets);
+	const written = recoverOnFailure
+		? await writeImportTargetsWithRollback(targets)
+		: await writeTargets(targets);
 	return {
 		filesWritten: written.filesWritten,
 		filesDeleted: 0,
 		externalFilesWritten: written.externalFilesWritten,
 	};
+}
+
+/** Capture exactly the import's targets, including previously unreferenced files. */
+async function writeImportTargetsWithRollback(targets: ArchiveTarget[]): Promise<{
+	filesWritten: number;
+	externalFilesWritten: number;
+}> {
+	// Publish merged settings only after the plugin payloads they reference exist.
+	const ordered = [...targets].sort((a, b) =>
+		Number(a.logicalPath === "settings.json") - Number(b.logicalPath === "settings.json"),
+	);
+	const originals = new Map<string, ArchiveTarget | undefined>();
+	for (const target of ordered) {
+		const stat = await lstatIfExists(target.absolutePath);
+		if (stat && !stat.isFile()) throw new Error(`Import target is not a regular file: ${target.logicalPath}`);
+		originals.set(target.absolutePath, stat
+			? { ...target, bytes: await fs.readFile(target.absolutePath), mode: stat.mode }
+			: undefined);
+	}
+	const touched: ArchiveTarget[] = [];
+	const result = { filesWritten: 0, externalFilesWritten: 0 };
+	try {
+		for (const target of ordered) {
+			touched.push(target);
+			const written = await writeTargets([target]);
+			result.filesWritten += written.filesWritten;
+			result.externalFilesWritten += written.externalFilesWritten;
+		}
+		return result;
+	} catch (error) {
+		let rollbackFailure: string | undefined;
+		for (const target of touched.reverse()) {
+			try {
+				const original = originals.get(target.absolutePath);
+				if (original) await writeTargets([original]);
+				else {
+					await assertPathHasNoSymlink(target.root, target.absolutePath, target.logicalPath);
+					await fs.rm(target.absolutePath, { force: true });
+				}
+			} catch (failure) {
+				rollbackFailure = errorMessage(failure);
+			}
+		}
+		if (rollbackFailure) throw new Error(`Import failed: ${errorMessage(error)}; rollback also failed: ${rollbackFailure}`);
+		throw new Error(`Import failed and selected files were rolled back: ${errorMessage(error)}`);
+	}
 }
 
 async function writeTargets(targets: ArchiveTarget[]): Promise<{

@@ -1,5 +1,14 @@
 import { safeRelativePath, toPosixPath } from "./paths.js";
 import {
+	SYNC_BACK,
+	SYNC_CANCEL,
+	type PickerPresentation,
+	type PickerSelection,
+	getDescendantLeaves,
+	getDirectorySelectionState,
+	alignPickerState,
+} from "./tree-picker.js";
+import {
 	archiveChildren,
 	archiveFileCount,
 	archiveFilePaths,
@@ -13,7 +22,6 @@ export type PickerSelect = (
 ) => Promise<string | undefined>;
 
 const USE_PREFIX = "__use__";
-const BACK_ID = "__back__";
 const DONE_ID = "__done__";
 
 /**
@@ -25,74 +33,113 @@ export async function choosePathsFallback(
 	select: PickerSelect | undefined,
 	profileName: string,
 	archive: ParsedArchive,
-): Promise<string[] | undefined> {
+	presentation?: PickerPresentation,
+): Promise<PickerSelection> {
 	if (!select)
 		throw new Error(
-			"No picker is available; /webdav-sync:pull --select needs an interactive terminal",
+			"No picker is available; selective push/pull needs an interactive terminal",
 		);
-	const selected: string[] = [];
-	const toggle = (value: string) => {
-		const index = selected.indexOf(value);
-		if (index === -1) selected.push(value);
-		else selected.splice(index, 1);
+	if (presentation?.state && !presentation.state.selected) {
+		presentation.state.selected = [];
+	}
+	const allArchiveFiles = archiveFilePaths(archive);
+	if (presentation?.state) alignPickerState(presentation.state, allArchiveFiles);
+	const selected: string[] = presentation?.state?.selected ?? [];
+
+	const toggleLeaves = (targetPath: string) => {
+		const leaves = getDescendantLeaves(allArchiveFiles, targetPath);
+		const status = getDirectorySelectionState(allArchiveFiles, selected, targetPath);
+		if (status === "all") {
+			const removeSet = new Set(leaves);
+			for (let i = selected.length - 1; i >= 0; i--) {
+				if (removeSet.has(selected[i])) selected.splice(i, 1);
+			}
+		} else {
+			const selSet = new Set(selected);
+			for (const leaf of leaves) {
+				if (!selSet.has(leaf)) {
+					selected.push(leaf);
+					selSet.add(leaf);
+				}
+			}
+		}
 	};
 	let prefix = "";
 	for (;;) {
 		const children = archiveChildren(archive, prefix);
 		const choices: Array<{ id: string; label: string }> = [];
-		if (selected.length)
+		if (selected.length) {
+			const action = presentation?.actionLabel ?? "Pull";
+			const destination =
+				presentation?.destinationLabel ?? "into the local config";
 			choices.push({
 				id: DONE_ID,
-				label: `✓ Pull ${selected.length} selection(s) into the local config`,
+				label: `✓ ${action} ${selected.length} selection(s) ${destination}`,
 			});
+		}
 		if (prefix) {
-			const wholeSelected = selected.includes(prefix);
+			const wholeStatus = getDirectorySelectionState(allArchiveFiles, selected, prefix);
+			const marker = wholeStatus === "all" ? "[x] " : wholeStatus === "partial" ? "[-] " : "[ ] ";
 			choices.push({
 				id: `${USE_PREFIX}${prefix}`,
-				label: `${wholeSelected ? "[x] " : "[ ] "}☑ whole directory ${prefix}/ (${archiveFileCount(archive, prefix)} ${archiveFileCount(archive, prefix) === 1 ? "file" : "files"})`,
+				label: `${marker}☑ whole directory ${prefix}/ (${archiveFileCount(archive, prefix)} ${archiveFileCount(archive, prefix) === 1 ? "file" : "files"})`,
 			});
-			choices.push({ id: BACK_ID, label: "↩ back to parent" });
 		}
 		for (const child of children) {
-			const isSelected = selected.includes(child.path);
-			choices.push({
-				id: child.path,
-				label:
-					child.type === "directory"
-						? `📁 ${isSelected ? "[x] " : "[ ] "}${child.path}/ (${child.files} ${child.files === 1 ? "file" : "files"})`
-						: `📄 ${isSelected ? "[x] " : "[ ] "}${child.path}`,
-			});
+			if (child.type === "directory") {
+				const status = getDirectorySelectionState(allArchiveFiles, selected, child.path);
+				const marker = status === "all" ? "[x] " : status === "partial" ? "[-] " : "[ ] ";
+				choices.push({
+					id: child.path,
+					label: `📁 ${marker}${child.path}/ (${child.files} ${child.files === 1 ? "file" : "files"})`,
+				});
+			} else {
+				const isSelected = selected.includes(child.path);
+				choices.push({
+					id: child.path,
+					label: `📄 ${isSelected ? "[x] " : "[ ] "}${child.path}`,
+				});
+			}
 		}
 		if (!choices.length) return selected.length ? selected : undefined;
-		const scope = prefix ? `${profileName} / ${prefix}` : profileName;
+		const baseTitle = presentation?.title ?? `Pull from ${profileName}`;
+		const promptTitle = prefix ? `${baseTitle} / ${prefix}` : baseTitle;
 		const picked = await select(
 			choices,
-			`Pull from ${scope} — ${selected.length} selected`,
+			`${promptTitle} — ${selected.length} selected`,
 		);
-		if (!picked) return undefined;
-		if (picked === DONE_ID) return selected;
-		if (picked === BACK_ID) {
-			prefix = prefix.includes("/")
-				? prefix.slice(0, prefix.lastIndexOf("/"))
-				: "";
-			continue;
+		if (picked === SYNC_CANCEL) {
+			return undefined;
 		}
+		if (picked === undefined || picked === SYNC_BACK) {
+			if (presentation?.allowBack) {
+				if (prefix) {
+					prefix = prefix.includes("/")
+						? prefix.slice(0, prefix.lastIndexOf("/"))
+						: "";
+					continue;
+				}
+				return SYNC_BACK;
+			}
+			return undefined;
+		}
+		if (picked === DONE_ID) return selected;
 		if (picked.startsWith(USE_PREFIX)) {
-			toggle(picked.slice(USE_PREFIX.length));
+			toggleLeaves(picked.slice(USE_PREFIX.length));
 			continue;
 		}
 		const entry = children.find((child) => child.path === picked);
 		if (!entry) continue;
-		if (entry.type === "directory") prefix = entry.path;
-		else toggle(entry.path);
+		if (entry.type === "directory") {
+			prefix = entry.path;
+		} else {
+			const idx = selected.indexOf(entry.path);
+			if (idx === -1) selected.push(entry.path);
+			else selected.splice(idx, 1);
+		}
 	}
 }
 
-/**
- * Expands path arguments — an exact file, a directory prefix, or a glob of `*`,
- * `**` and `?` — into archive file paths. A glob also matches whole directories,
- * so `extensions/my-plugin*` brings the entire subtree.
- */
 /**
  * Expands picked archive paths — an exact file or a directory prefix — into the
  * file paths to write. Directory names come from the "whole directory" rows of

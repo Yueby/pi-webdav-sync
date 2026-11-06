@@ -1470,17 +1470,13 @@ try {
 		backend: packagesBackend,
 		confirmPush: async () => true,
 	});
-	// Two ways a machine already has a package: its settings list (here with a
-	// version suffix, so the name has to be compared, not the raw string), or the
-	// package directory under Pi's npm install root (one scoped, one plain).
+	// Installed packages need real metadata, whether or not settings lists them.
 	const seedPackagesTarget = async (dir) => {
-		await fs.mkdir(
-			path.join(dir, "npm", "node_modules", "@juicesharp", "rpiv-todo"),
-			{ recursive: true },
-		);
-		await fs.mkdir(path.join(dir, "npm", "node_modules", "pi-goal-x"), {
-			recursive: true,
-		});
+		for (const name of ["pi-web-access", "pi-subagents", "@juicesharp/rpiv-todo", "pi-goal-x"]) {
+			const packageDir = path.join(dir, "npm", "node_modules", name);
+			await fs.mkdir(packageDir, { recursive: true });
+			await fs.writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name, version: "1.2.3" }));
+		}
 		await fs.writeFile(
 			path.join(dir, "settings.json"),
 			`${JSON.stringify(
@@ -1539,6 +1535,7 @@ try {
 			backend: packagesBackend,
 			choosePaths: async (_profile, files) =>
 				files.filter((file) => file === "AGENTS.md"),
+			selectProfile: async () => "apply",
 			confirmInstallPackages: async (specs) => {
 				askedForSelection = specs;
 				return false;
@@ -1573,6 +1570,7 @@ try {
 			backend: packagesBackend,
 			choosePaths: async (_profile, files) =>
 				files.filter((file) => file === "settings.json"),
+			selectProfile: async () => "apply",
 			confirmInstallPackages: async (specs) => {
 				askedWithSettings = specs;
 				return false;
@@ -4858,11 +4856,12 @@ try {
 			backend: selectiveBackend,
 			selectProfile: async (choices, message) => {
 				pullMessages.push(message ?? "(no message)");
+				if ((message ?? "").startsWith("Review ")) return "apply";
 				if ((message ?? "").includes("what should be applied")) {
 					scopeChoices = choices.map((choice) => choice.label);
 					return choices.find((choice) =>
 						choice.label.includes("Choose files"),
-					)?.id;
+					)?.id ?? choices.find((choice) => choice.id === "all")?.id;
 				}
 				const wanted = pullScript[pullStep];
 				pullStep += 1;
@@ -4943,6 +4942,7 @@ try {
 			agentDir: selectiveAgent,
 			backend: selectiveBackend,
 			selectProfile: async (choices, message) => {
+				if ((message ?? "").startsWith("Review ")) return "apply";
 				if ((message ?? "").includes("what should be applied")) {
 					scopeAsked = true;
 					return choices[0]?.id;
@@ -5055,7 +5055,7 @@ try {
 	assert.equal(reduceTreePicker(picker, "space"), "changed", "space is handled");
 	assert.deepEqual(
 		treePickerSelection(picker),
-		["extensions"],
+		["extensions/plug/helper.js", "extensions/plug/index.js"],
 		"space selects the whole folder",
 	);
 	assert.equal(
@@ -5135,7 +5135,8 @@ try {
 	assert.equal(pickerActionFor("\x1b[A"), "up", "up arrow is mapped");
 	assert.equal(pickerActionFor("\x1b[B"), "down", "down arrow is mapped");
 	assert.equal(pickerActionFor("\x1b[D"), "left", "left arrow is mapped");
-	assert.equal(pickerActionFor("\x1b"), "cancel", "escape cancels");
+	assert.equal(pickerActionFor("\x1b"), "back", "escape returns to the preceding step");
+	assert.equal(pickerActionFor("\x03"), "cancel", "Ctrl+C cancels");
 	assert.equal(pickerActionFor("x"), undefined, "unrelated keys are ignored");
 
 	// the component renders within bounds and returns the selection through done()
@@ -5162,7 +5163,7 @@ try {
 	component2.handleInput("\r");
 	assert.deepEqual(
 		componentSelection,
-		["extensions"],
+		["extensions/plug/helper.js", "extensions/plug/index.js"],
 		"the Done row returns the selection",
 	);
 
@@ -5283,6 +5284,25 @@ try {
 		sawAbove && sawBelow,
 		"a list longer than the viewport shows both scroll indicators",
 	);
+
+	const { runModelImportTests } = await import("./model-import-test.mjs");
+	await runModelImportTests();
+	const { runImportSelfTests } = await import("./import-self-test.mjs");
+	await runImportSelfTests({ MemoryBackend });
+	const { runRemoteMergeTests } = await import("./remote-merge-test.mjs");
+	await runRemoteMergeTests();
+	const { runSyncWizardTests } = await import("./sync-wizard-test.mjs");
+	await runSyncWizardTests({ MemoryBackend });
+	const { runTreeSelectionTests } = await import("./tree-selection-test.mjs");
+	await runTreeSelectionTests();
+	const { runPackageStateTests } = await import("./package-state-test.mjs");
+	await runPackageStateTests();
+	const { runDesignRegressionTests } = await import("./design-regression-test.mjs");
+	await runDesignRegressionTests({ MemoryBackend });
+	const { runSyncSessionTests } = await import("./sync-session-test.mjs");
+	await runSyncSessionTests();
+	const { runPersistentSyncTests } = await import("./persistent-sync-test.mjs");
+	await runPersistentSyncTests({ MemoryBackend });
 
 	console.log("self-test passed");
 } finally {

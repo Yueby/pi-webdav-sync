@@ -8,6 +8,11 @@
  * can be tested without a terminal.
  */
 
+export const SYNC_BACK = "__sync_back__";
+export const SYNC_CANCEL = "__sync_cancel__";
+
+export type PickerSelection = string[] | typeof SYNC_BACK | undefined;
+
 export const DONE_PATH = "\u0000done";
 const DONE_ID = "done";
 
@@ -36,7 +41,8 @@ export type TreePickerAction =
 	| "enter"
 	| "left"
 	| "right"
-	| "cancel";
+	| "cancel"
+	| "back";
 
 export type TreePickerTheme = {
 	fg(color: string, text: string): string;
@@ -47,7 +53,15 @@ export type TreePickerTheme = {
 	underline?(text: string): string;
 };
 
-export type TreePickerOptions = {
+export type PickerPresentation = {
+	title?: string;
+	actionLabel?: string;
+	allowBack?: boolean;
+	state?: TreePickerState;
+	destinationLabel?: string;
+};
+
+export type TreePickerOptions = PickerPresentation & {
 	theme?: TreePickerTheme;
 	height?: number;
 };
@@ -110,6 +124,30 @@ function childrenOf(state: TreePickerState, prefix: string): ChildEntry[] {
 	);
 }
 
+/** Returns all descendant leaf files under a folder path or prefix. */
+export function getDescendantLeaves(files: string[], dirPath: string): string[] {
+	const prefix = dirPath ? `${dirPath}/` : "";
+	return files.filter((f) => (prefix ? f.startsWith(prefix) : true));
+}
+
+/** Determines tri-state status of a folder: 'all', 'partial', or 'none'. */
+export function getDirectorySelectionState(
+	files: string[],
+	selected: string[],
+	dirPath: string,
+): "all" | "partial" | "none" {
+	const leaves = getDescendantLeaves(files, dirPath);
+	if (leaves.length === 0) return "none";
+	const selectedSet = new Set(selected);
+	let matchCount = 0;
+	for (const leaf of leaves) {
+		if (selectedSet.has(leaf)) matchCount++;
+	}
+	if (matchCount === 0) return "none";
+	if (matchCount === leaves.length) return "all";
+	return "partial";
+}
+
 /** Rows currently in the tree, followed by the Done row when something is selected. */
 export function treePickerRows(state: TreePickerState): TreePickerRow[] {
 	const rows: TreePickerRow[] = [];
@@ -141,15 +179,18 @@ export function treePickerRows(state: TreePickerState): TreePickerRow[] {
 }
 
 export function treePickerSelection(state: TreePickerState): string[] {
-	return [...state.selected].sort();
+	const files = new Set(state.files);
+	return [...new Set(state.selected.flatMap((item) => files.has(item)
+		? [item] : getDescendantLeaves(state.files, item)))].sort();
 }
 
 export function reduceTreePicker(
 	state: TreePickerState,
 	action: TreePickerAction,
-): "changed" | "done" | "cancel" {
+): "changed" | "done" | "cancel" | "back" {
 	const rows = treePickerRows(state);
 	if (action === "cancel") return "cancel";
+	if (action === "back") return "back";
 	if (!rows.length) return "changed";
 	const index = Math.min(Math.max(state.index, 0), rows.length - 1);
 	const row = rows[index];
@@ -164,7 +205,26 @@ export function reduceTreePicker(
 	if (row.path === DONE_PATH)
 		return action === "space" || action === "enter" ? "done" : "changed";
 	if (action === "space") {
-		toggle(state.selected, row.path);
+		if (row.type === "directory") {
+			const leaves = getDescendantLeaves(state.files, row.path);
+			const dirState = getDirectorySelectionState(state.files, state.selected, row.path);
+			if (dirState === "all") {
+				const toRemove = new Set(leaves);
+				for (let i = state.selected.length - 1; i >= 0; i--) {
+					if (toRemove.has(state.selected[i])) state.selected.splice(i, 1);
+				}
+			} else {
+				const selSet = new Set(state.selected);
+				for (const leaf of leaves) {
+					if (!selSet.has(leaf)) {
+						state.selected.push(leaf);
+						selSet.add(leaf);
+					}
+				}
+			}
+		} else {
+			toggle(state.selected, row.path);
+		}
 		anchorIndex(state, row.path);
 		return "changed";
 	}
@@ -206,7 +266,8 @@ export function pickerActionFor(data: string): TreePickerAction | undefined {
 	if (data === "\x1b[B" || data === "down") return "down";
 	if (data === "\x1b[C" || data === "right") return "right";
 	if (data === "\x1b[D" || data === "left") return "left";
-	if (data === "\x1b" || data === "\x03" || data === "escape") return "cancel";
+	if (data === "\x03" || data === "ctrl+c") return "cancel";
+	if (data === "\x1b" || data === "escape") return "back";
 	return undefined;
 }
 
@@ -216,7 +277,7 @@ const ANSI_REGEX = /\x1b\[[0-9;]*[a-zA-Z]/g;
  * Closes colour and bold without clearing an enclosing background: a full
  * `\x1b[0m` would end the highlight bar mid-row, leaving the rest unpainted.
  */
-const ROW_RESET = "\x1b[39m\x1b[22m";
+export const ROW_RESET = "\x1b[39m\x1b[22m";
 
 export function stripAnsi(str: string): string {
 	return str.replace(ANSI_REGEX, "");
@@ -293,7 +354,7 @@ export function truncateToWidth(
 	return activeAnsi ? `${result}${reset}${ellipsis}` : `${result}${ellipsis}`;
 }
 
-function computeViewport(
+export function computeViewport(
 	total: number,
 	maxRows: number,
 	selectedIndex: number,
@@ -362,13 +423,53 @@ function computeViewport(
 	};
 }
 
+export function alignPickerState(
+	state: TreePickerState,
+	files: string[],
+): TreePickerState {
+	state.files = [...files].sort();
+	const validFiles = new Set(state.files);
+	const validDirs = new Set<string>();
+	for (const file of state.files) {
+		let slash = file.indexOf("/");
+		while (slash !== -1) {
+			validDirs.add(file.slice(0, slash));
+			slash = file.indexOf("/", slash + 1);
+		}
+	}
+	for (let i = state.expanded.length - 1; i >= 0; i--) {
+		if (!validDirs.has(state.expanded[i])) {
+			state.expanded.splice(i, 1);
+		}
+	}
+	const normalizedLeaves = new Set<string>();
+	for (const item of state.selected) {
+		if (validFiles.has(item)) {
+			normalizedLeaves.add(item);
+		} else if (validDirs.has(item)) {
+			for (const leaf of getDescendantLeaves(state.files, item)) {
+				normalizedLeaves.add(leaf);
+			}
+		}
+	}
+	state.selected.length = 0;
+	state.selected.push(...[...normalizedLeaves].sort());
+
+	if (typeof state.index !== "number" || isNaN(state.index) || state.index < 0) {
+		state.index = 0;
+	}
+	return state;
+}
+
 export function createTreePickerComponent(
 	profileName: string,
 	files: string[],
-	done: (value: string[] | undefined) => void,
+	done: (value: PickerSelection) => void,
 	options?: TreePickerOptions,
 ): TreePickerComponent {
-	const state = createTreePickerState(files);
+	const state = options?.state
+		? alignPickerState(options.state, files)
+		: createTreePickerState(files);
 	let scrollOffset = 0;
 	const theme = options?.theme;
 
@@ -408,11 +509,17 @@ export function createTreePickerComponent(
 			const lines: string[] = [];
 
 			// 1. Header
-			const headerPrefix = ` Pull from ${profileName}`;
+			const titleText = options?.title ?? `Pull from ${profileName}`;
+			const titleDisplay = theme
+				? options?.title
+					? theme.bold(options.title)
+					: `Pull from ${theme.bold(profileName)}`
+				: titleText;
 			const headerCount = ` · ${selectedCount} selected`;
-			const headerLine = theme
-				? ` Pull from ${theme.bold(profileName)} · ${theme.fg(selectedCount > 0 ? "accent" : "dim", `${selectedCount} selected`)}`
-				: `${headerPrefix}${headerCount}`;
+			const countDisplay = theme
+				? ` · ${theme.fg(selectedCount > 0 ? "accent" : "dim", `${selectedCount} selected`)}`
+				: headerCount;
+			const headerLine = ` ${titleDisplay}${countDisplay}`;
 			lines.push(truncateToWidth(headerLine, width));
 
 			// 2. Blank line after header
@@ -442,12 +549,13 @@ export function createTreePickerComponent(
 					const arrowChar = isExp ? "▾" : "▸";
 					const arrowText =
 						(theme ? theme.fg("dim", arrowChar) : arrowChar) + " ";
-					const isSel = state.selected.includes(row.path);
-					const markerText = isSel
-						? theme
-							? theme.fg("success", "[x]") + " "
-							: "[x] "
-						: "";
+					const dirState = getDirectorySelectionState(state.files, state.selected, row.path);
+					const markerText =
+						dirState === "all"
+							? theme ? theme.fg("success", "[x]") + " " : "[x] "
+							: dirState === "partial"
+								? theme ? theme.fg("accent", "[-]") + " " : "[-] "
+								: theme ? theme.fg("dim", "[ ]") + " " : "[ ] ";
 					const nameText = theme
 						? theme.fg("accent", `${row.name}/`)
 						: `${row.name}/`;
@@ -512,7 +620,10 @@ export function createTreePickerComponent(
 						: " ❯  "
 					: "    ";
 				const doneIcon = theme ? theme.fg("success", "✓") : "✓";
-				const doneLabel = `Pull ${selectedCount} selection(s) into the local config`;
+				const action = options?.actionLabel ?? "Pull";
+				const destination =
+					options?.destinationLabel ?? "into the local config";
+				const doneLabel = `${action} ${selectedCount} selection(s) ${destination}`;
 				const doneText = theme
 					? theme.bold(theme.fg("success", doneLabel))
 					: doneLabel;
@@ -531,7 +642,10 @@ export function createTreePickerComponent(
 			}
 
 			// 6. Footer help line
-			const footerText = ` ${TREE_PICKER_HELP}`;
+			const helpText = options?.allowBack
+				? "Space select · Enter expand · ←→ collapse · Esc back · Ctrl+C cancel"
+				: TREE_PICKER_HELP;
+			const footerText = ` ${helpText}`;
 			const formattedFooter = theme ? theme.fg("dim", footerText) : footerText;
 			lines.push(truncateToWidth(formattedFooter, width, "…"));
 
@@ -547,6 +661,11 @@ export function createTreePickerComponent(
 			}
 			if (result === "cancel") {
 				done(undefined);
+				return;
+			}
+			if (result === "back") {
+				done(options?.allowBack ? SYNC_BACK : undefined);
+				return;
 			}
 		},
 	};

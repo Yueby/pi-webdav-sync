@@ -24,9 +24,15 @@ import {
 	writeLocalState,
 	type WebdavSyncConfig,
 } from "./config.js";
-import { createLatestIndex, type LatestIndex, shortHash } from "./manifest.js";
-import { getAgentDir, pathInside } from "./paths.js";
-import { isInstallableSpec, npmPackageName, extractPackageSpecs } from "./package-specs.js";
+import { createLatestIndex, type LatestIndex, shortHash, sha256Bytes } from "./manifest.js";
+import { getAgentDir, pathInside, resolveConfiguredPath } from "./paths.js";
+import { isInstallableSpec } from "./package-specs.js";
+import { missingInstalledPackages } from "./package-state.js";
+import { createImportArchive, mergeRemoteArchive, importArchivePaths, importCatalog, importLabel, jsonBytes, parseImportJson } from "./import-plan.js";
+import { pluginImportChoices, mergePluginImport, includeSettingsDependencies } from "./plugin-import.js";
+import { modelImportChoices, modelConnectionConflicts, mergeModelImport } from "./model-import.js";
+import type { PickerPresentation, PickerSelection } from "./tree-picker.js";
+import { runSyncNavigation, isNavigationSignal } from "./sync-navigation.js";
 import {
 	DEFAULT_PROFILE,
 	LAYOUT_MARKER,
@@ -75,12 +81,19 @@ export type CommandContext = {
 	selectProfile?: (
 		choices: ProfileChoice[],
 		message?: string,
+		stepId?: string,
 	) => Promise<string | undefined>;
-	inputProfileName?: (existing: string[]) => Promise<string | undefined>;
+	/** Sync-only step menu: Esc back, Ctrl+C cancel. Management menus are unchanged. */
+	selectStep?: (choices: ProfileChoice[], message: string, initialId?: string) => Promise<string | undefined>;
+	/** Ephemeral wizard identity; never persisted in configuration or snapshots. */
+	setSyncScope?: (scope: { profile?: string; snapshot?: string; sourceRevision?: string; destinationRevision?: string; category?: string }) => void;
+	inputProfileName?: (existing: string[], initialValue?: string) => Promise<string | undefined>;
+	/** Persistent UI lifecycle; committing is entered before migration/backup/write side effects. */
+	onSyncPhase?: (phase: "planning" | "committing", message?: string) => void;
 	confirmPush?: (preview: PushPreview) => Promise<boolean>;
 	confirmOverwriteConfig?: (path: string) => Promise<boolean>;
 	fetchRemoteConfig?: (url: string) => Promise<unknown>;
-	confirmInstallPackages?: (specs: string[]) => Promise<boolean>;
+	confirmInstallPackages?: (specs: string[], mode?: "import") => Promise<boolean>;
 	confirmRestore?: (preview: RestorePreview) => Promise<boolean>;
 	confirmProfileDelete?: (preview: ProfileDeletePreview) => Promise<boolean>;
 	confirmProfileMigrate?: (preview: ProfileMigratePreview) => Promise<boolean>;
@@ -88,7 +101,8 @@ export type CommandContext = {
 	choosePaths?: (
 		profileName: string,
 		files: string[],
-	) => Promise<string[] | undefined>;
+		presentation?: PickerPresentation,
+	) => Promise<PickerSelection>;
 	installPackage?: (spec: string) => Promise<number | null>;
 	onInstallProgress?: (progress: InstallProgress) => void;
 };
@@ -107,6 +121,8 @@ type ParsedArgs = {
 	createProfile?: string;
 	assumeYes?: boolean;
 	select?: boolean;
+	models?: boolean;
+	plugins?: boolean;
 	positional: string[];
 };
 
@@ -173,9 +189,9 @@ export async function runWebdavSyncCommand(
 		if (command === "init")
 			return await commandInit(agentDir, context, commandArgs);
 		if (command === "push")
-			return await commandPush(agentDir, context, commandArgs);
+			return await runSyncNavigation(context, "push", (navigable) => commandPush(agentDir, navigable, commandArgs));
 		if (command === "pull")
-			return await commandPull(agentDir, context, commandArgs);
+			return await runSyncNavigation(context, "pull", (navigable) => commandPull(agentDir, navigable, commandArgs));
 		if (command === "restore")
 			return await commandRestore(agentDir, context, commandArgs);
 		if (command === "status")
@@ -238,20 +254,16 @@ async function commandPush(
 	const rootBackend = context.backend || createWebdavBackend(config);
 	await assertSupportedLayout(rootBackend);
 	const notes: string[] = [];
-	const migrated = await autoMigrateLegacyLayout(
-		rootBackend,
-		agentDir,
-		config,
-		notes,
-	);
-	if (migrated && parsed.createProfile === DEFAULT_PROFILE) {
-		// Migrating just created the default profile, so this is an update, not a create.
+	const legacyLayout = await readRemoteLayout(rootBackend);
+	if (legacyLayout.legacy && parsed.createProfile === DEFAULT_PROFILE) {
+		// The approved migration will create default, so plan this as an update.
 		parsed.profile = DEFAULT_PROFILE;
 		parsed.createProfile = undefined;
 	}
-	const target = await resolveProfileTarget(rootBackend, context, parsed, {
+	let target = await resolveProfileTarget(rootBackend, context, parsed, {
 		allowCreate: true,
 		requireExisting: false,
+		deferCreate: true,
 	}, agentDir);
 	if (!target)
 		return ok(
@@ -260,7 +272,40 @@ async function commandPush(
 		);
 
 	const collected = await collectAgentArchive(agentDir, config);
-	const zip = createLatestZip(collected.zipEntries, collected.manifest);
+	let zip = createLatestZip(collected.zipEntries, collected.manifest);
+	const source = parseArchive(zip.zipBytes, zip.latest.zipSha256, config);
+	context.setSyncScope?.({ profile: target.name, snapshot: "local", sourceRevision: source.manifest.contentSha256 });
+	const scope = context.selectStep || parsed.models || parsed.plugins || parsed.select
+		? await choosePullScope(context, target.name, source,
+			parsed.models ? "models" : parsed.plugins ? "plugins" : parsed.select ? "files" : undefined, "push")
+		: { kind: "everything" as const };
+	if (scope.kind === "cancelled") return ok("push: cancelled; nothing was uploaded", { cancelled: true });
+	let destination: ParsedArchive | undefined;
+	let destinationHash: string | undefined;
+	let transfer: TransferPlan | undefined;
+	if (scope.kind !== "everything") {
+		const remote = await readRemoteArchive(target.backend, config);
+		destination = remote?.archive;
+		destinationHash = remote?.hash;
+		context.setSyncScope?.({ destinationRevision: destinationHash ?? "missing" });
+		if (destination && archiveSettingsMode(destination) === "raw")
+			throw new Error("Cannot merge into a raw backup profile; upload a portable full profile first");
+		if (scope.kind === "selected") {
+			const expanded = includeSettingsDependencies(source, scope.paths);
+			const patch = createImportArchive(source, expanded, new Map(), config);
+			transfer = { archive: patch, paths: importArchivePaths(patch), packageSettings: undefined, summary: [`selected files: ${scope.paths.length}`, `dependency files: ${expanded.length - scope.paths.length}`] };
+		} else {
+			transfer = await prepareTransfer(context, config, target.name, source, scope.kind,
+				async (file) => parseImportJson(destination?.entries.get(`files/${file}`), `Destination ${file}`), "push");
+		}
+		if (!transfer) return ok("push: cancelled; nothing was uploaded", { cancelled: true });
+		const merged = mergeRemoteArchive(destination, transfer.archive, config);
+		transfer.archive = merged;
+		zip = createLatestZip(merged.entries, merged.manifest);
+		const existingPaths = new Set(destination ? importArchivePaths(destination) : []);
+		if (!(await reviewTransfer(context, transfer, target.name, scope.kind, "push", async (file) => existingPaths.has(file))))
+			return ok("push: cancelled; nothing was uploaded", { cancelled: true });
+	}
 	const preview: PushPreview = {
 		profile: target.name,
 		fileCount: zip.latest.fileCount,
@@ -269,7 +314,7 @@ async function commandPush(
 		hash: shortHash(zip.latest.contentSha256),
 		warnings: collected.warnings,
 	};
-	if (context.confirmPush && !(await context.confirmPush(preview))) {
+	if (!transfer && context.confirmPush && !(await context.confirmPush(preview))) {
 		return ok(
 			[
 				"push: cancelled",
@@ -282,6 +327,16 @@ async function commandPush(
 			preview,
 		);
 	}
+	if (transfer) {
+		const current = await readRemoteArchive(target.backend, config);
+		if (current?.hash !== destinationHash)
+			throw new Error("Destination profile changed during selection; retry to review its current contents");
+	}
+	context.onSyncPhase?.("committing", "Uploading configuration…");
+	await autoMigrateLegacyLayout(rootBackend, agentDir, config, notes);
+	if (target.legacyRoot)
+		target = await existingProfileTarget(rootBackend, target.name, { requireExisting: true });
+	if (target.created) target = await claimNewProfile(rootBackend, target.name);
 	const backend = target.backend;
 	if (target.created && (await backend.exists("latest.json")))
 		throw new Error(
@@ -290,14 +345,11 @@ async function commandPush(
 	const snapshotId = snapshotIdFromDate(new Date(zip.latest.createdAt));
 	const snapshotZip = `snapshots/${snapshotId}.zip`;
 	const snapshotJson = `snapshots/${snapshotId}.json`;
+	// Publish history first: a failed snapshot write must not replace latest.
+	await backend.putBytes(snapshotZip, zip.zipBytes);
+	await backend.putJson(snapshotJson, { ...zip.latest, snapshotId, zip: snapshotZip });
 	await backend.putBytes("latest.zip", zip.zipBytes);
 	await backend.putJson("latest.json", zip.latest);
-	await backend.putBytes(snapshotZip, zip.zipBytes);
-	await backend.putJson(snapshotJson, {
-		...zip.latest,
-		snapshotId,
-		zip: snapshotZip,
-	});
 	const lines = [
 		"push: ok",
 		`profile: ${target.name}`,
@@ -305,6 +357,8 @@ async function commandPush(
 		`external: ${zip.latest.externalResourceCount}`,
 		`packages: ${zip.latest.packageSpecs.length}`,
 		`hash: ${shortHash(zip.latest.contentSha256)}`,
+		...(transfer ? [`mode: ${scope.kind} upload`, ...transfer.summary] : []),
+		...(scope.kind === "models" || scope.kind === "plugins" ? ["current profile: unchanged"] : []),
 	];
 	appendPasswordWarning(lines, config);
 	lines.push(...notes);
@@ -328,42 +382,51 @@ async function commandPush(
 		);
 	}
 	// The profile only becomes "current" once something was actually uploaded.
-	await rememberProfile(agentDir, target.name);
+	if (scope.kind !== "models" && scope.kind !== "plugins") await rememberProfile(agentDir, target.name);
 	return ok(lines.join("\n"), { ...zip.latest, profile: target.name });
 }
 
 const SELECT_ID = "__select__";
 
-/**
- * Asks whether the whole profile should be applied or only picked files, then
- * returns the selection (an empty list means "everything").
- */
+type PullScope =
+	| { kind: "cancelled" }
+	| { kind: "everything" }
+	| { kind: "selected"; paths: string[] }
+	| { kind: "models" | "plugins" };
+
+/** Category shortcuts merge into local state; All content retains file pulling. */
 async function choosePullScope(
 	context: CommandContext,
 	profileName: string,
 	archive: ParsedArchive,
-	selectRequested: boolean,
-): Promise<{ cancelled: boolean; paths?: string[] }> {
-	if (!selectRequested && !context.choosePaths && !context.selectProfile)
-		return { cancelled: false };
-	if (!selectRequested && context.selectProfile) {
-		const scope = await context.selectProfile(
-			[
-				{ id: "all", label: "✓ Everything (replace the local config)" },
-				{ id: SELECT_ID, label: "Choose files… (only apply the selection)" },
-			],
-			`Pull from ${profileName}: what should be applied?`,
-		);
-		if (!scope) return { cancelled: true };
-		if (scope !== SELECT_ID) return { cancelled: false };
+	requested?: "files" | "models" | "plugins",
+	direction: "push" | "pull" = "pull",
+): Promise<PullScope> {
+	context.setSyncScope?.({ category: requested ?? "category" });
+	if (requested === "models" || requested === "plugins") return { kind: requested };
+	if (!requested && !context.choosePaths && !context.selectProfile)
+		return { kind: "everything" };
+	if (!requested && context.selectProfile) {
+		const category = await context.selectProfile([
+			{ id: "all", label: "All content…" },
+			{ id: "models", label: "Models… (merge selected models)" },
+			{ id: "plugins", label: direction === "push" ? "Plugins and configuration… (merge into the destination profile)" : "Plugins and configuration… (merge into local config)" },
+		], `${direction === "push" ? "Push to" : "Pull from"} ${profileName}: what should be applied?`, "category");
+		if (!category) return { kind: "cancelled" };
+		context.setSyncScope?.({ category: category === "models" || category === "plugins" ? category : "files" });
+		if (category === "models" || category === "plugins") return { kind: category };
+		const scope = await context.selectProfile([
+			{ id: "all", label: direction === "push" ? "✓ Everything (replace the destination profile)" : "✓ Everything (replace the local config)" },
+			{ id: SELECT_ID, label: "Choose files… (only apply the selection)" },
+		], `${direction === "push" ? "Push to" : "Pull from"} ${profileName}: what should be applied?`, "file-scope");
+		if (!scope) return { kind: "cancelled" };
+		if (scope !== SELECT_ID) return { kind: "everything" };
 	}
-	const selection = await selectPathsInteractively(
-		context,
-		profileName,
-		archive,
-	);
-	if (selection === undefined) return { cancelled: true };
-	return { cancelled: false, paths: selectArchivePaths(archive, selection) };
+	const selection = await selectPathsInteractively(context, profileName, archive, direction === "push"
+		? { title: `Upload files to ${profileName}`, actionLabel: "Review", destinationLabel: `into remote profile ${profileName}` }
+		: undefined);
+	if (selection === undefined) return { kind: "cancelled" };
+	return { kind: "selected", paths: selectArchivePaths(archive, selection) };
 }
 
 /**
@@ -374,15 +437,19 @@ async function selectPathsInteractively(
 	context: CommandContext,
 	profileName: string,
 	archive: ParsedArchive,
+	presentation?: PickerPresentation,
 ): Promise<string[] | undefined> {
 	if (context.choosePaths) {
 		try {
-			return await context.choosePaths(profileName, archiveFilePaths(archive));
-		} catch {
-			// No custom component available (RPC/print): use the plain picker.
+			const result = await context.choosePaths(profileName, archiveFilePaths(archive), presentation);
+			return Array.isArray(result) ? result : undefined;
+		} catch (error) {
+			if (isNavigationSignal(error)) throw error;
+			if (!(error instanceof Error) || error.message !== "Custom picker unavailable") throw error;
 		}
 	}
-	return await choosePathsFallback(context.selectProfile, profileName, archive);
+	const result = await choosePathsFallback(context.selectProfile, profileName, archive, presentation);
+	return Array.isArray(result) ? result : undefined;
 }
 
 async function commandPull(
@@ -397,7 +464,6 @@ async function commandPull(
 	const rootBackend = context.backend || createWebdavBackend(config);
 	await assertSupportedLayout(rootBackend);
 	const notes: string[] = [];
-	await autoMigrateLegacyLayout(rootBackend, agentDir, config, notes);
 	const target = await resolveProfileTarget(
 		rootBackend,
 		context,
@@ -413,6 +479,7 @@ async function commandPull(
 			["pull: cancelled", "nothing was downloaded or applied"].join("\n"),
 			{ cancelled: true },
 		);
+	context.setSyncScope?.({ profile: target.name });
 	const backend = target.backend;
 	const snapshot = await chooseSnapshot(
 		backend,
@@ -428,43 +495,60 @@ async function commandPull(
 	const zipBytes = await backend.getBytes(snapshot.zipPath);
 	const archive = parseArchive(zipBytes, latest.zipSha256, config);
 	validateLatestMatchesManifest(latest, archive);
-	const diff = await diffArchiveAgainstLocal(agentDir, archive, config);
+	context.setSyncScope?.({ snapshot: snapshot.id, sourceRevision: latest.zipSha256 });
 	const scope = await choosePullScope(
 		context,
 		target.name,
 		archive,
-		parsed.select === true,
+		parsed.models ? "models" : parsed.plugins ? "plugins" : parsed.select ? "files" : undefined,
 	);
-	if (scope.cancelled)
+	if (scope.kind === "cancelled")
 		return ok(
 			["pull: cancelled", "nothing was downloaded or applied"].join("\n"),
 			{ cancelled: true },
 		);
+	if (scope.kind === "models" || scope.kind === "plugins")
+		return await commandImport(agentDir, context, config, target.name, snapshot.id, archive, scope.kind,
+			() => autoMigrateLegacyLayout(rootBackend, agentDir, config, notes).then(() => undefined));
+	const diff = await diffArchiveAgainstLocal(agentDir, archive, config);
+	const selectedPaths = scope.kind === "selected" ? includeSettingsDependencies(archive, scope.paths) : undefined;
 	const snapshotSettings = await settingsJsonFromArchive(archive);
 	// A selective pull leaves the machine's settings.json alone unless it is part of
 	// the selection, so packages only matter when that file travels with it.
 	const packages =
-		!scope.paths || scope.paths.includes("settings.json")
+		!selectedPaths || selectedPaths.includes("settings.json")
 			? await missingPackagesOnThisMachine(agentDir, snapshotSettings)
 			: [];
+	let selectedPlan: TransferPlan | undefined;
+	const preconditions: LocalPreconditions = new Map();
+	if (selectedPaths && scope.kind === "selected") {
+		const subset = createImportArchive(archive, selectedPaths, new Map(), config);
+		selectedPlan = { archive: subset, paths: selectedPaths, packageSettings: undefined, localPreconditions: preconditions,
+			summary: [`selected files: ${scope.paths.length}`, `dependency files: ${selectedPaths.length - scope.paths.length}`] };
+		await captureLocalTargets(agentDir, selectedPaths, preconditions);
+		context.setSyncScope?.({ destinationRevision: localRevision(preconditions) });
+		if (!(await reviewTransfer(context, selectedPlan, target.name, "selected files", "pull",
+			async (file) => preconditions.get(file) !== null, packages.length)))
+			return ok("pull: cancelled; nothing was applied", { cancelled: true });
+	}
+	const shouldInstall = await shouldInstallPackages(packages, config, context.confirmInstallPackages);
+	await verifyLocalTargets(agentDir, preconditions);
+	context.onSyncPhase?.("committing", "Applying downloaded configuration…");
+	await autoMigrateLegacyLayout(rootBackend, agentDir, config, notes);
 	const backup = await createLocalBackup(
 		agentDir,
 		config.backupRetention ?? 5,
 		config,
 	);
-	const applied = scope.paths
-		? await applyArchivePaths(agentDir, archive, scope.paths, config)
+	await verifyLocalTargets(agentDir, preconditions);
+	const applied = selectedPlan
+		? await applyArchivePaths(agentDir, selectedPlan.archive, selectedPlan.paths, config, true)
 		: await applyArchiveWithRollback(
 				agentDir,
 				archive,
 				backup.id,
 				config,
 			);
-	const shouldInstall = await shouldInstallPackages(
-		packages,
-		config,
-		context.confirmInstallPackages,
-	);
 	const installResults = shouldInstall
 		? await installPackages(
 				packages,
@@ -475,7 +559,7 @@ async function commandPull(
 	const lines = [
 		`pull: ${target.name === DEFAULT_PROFILE ? snapshot.id : `${target.name}/${snapshot.id}`}`,
 		`profile: ${target.name}`,
-		`mode: ${scope.paths ? `selected (${scope.paths.length} file(s))` : "everything"}`,
+		`mode: ${selectedPaths ? `selected (${selectedPaths.length} file(s))` : "everything"}`,
 		`backup: ${backup.id}`,
 		`files: ${applied.filesWritten}`,
 		`external: ${applied.externalFilesWritten}`,
@@ -513,6 +597,176 @@ async function commandPull(
 		applied,
 		packages,
 	});
+}
+
+type LocalPreconditions = Map<string, string | null>;
+type TransferPlan = { archive: ParsedArchive; paths: string[]; packageSettings: unknown; summary: string[]; localPreconditions?: LocalPreconditions };
+
+/** The same merge plan serves downloads and uploads; it performs no writes. */
+async function prepareTransfer(
+	context: CommandContext,
+	config: WebdavSyncConfig,
+	profileName: string,
+	archive: ParsedArchive,
+	kind: "models" | "plugins",
+	readDestination: (file: string) => Promise<Record<string, unknown>>,
+	direction: "push" | "pull",
+): Promise<TransferPlan | undefined> {
+	const cancelled = () => undefined;
+	const sourceModels = kind === "models"
+		? parseImportJson(archive.entries.get("files/models.json"), "Snapshot models.json")
+		: undefined;
+	const choices = kind === "models" ? modelImportChoices(sourceModels) : pluginImportChoices(archive);
+	if (!choices.length) {
+		if (context.selectStep && context.selectProfile) {
+			await context.selectProfile([], `The source has no ${kind} to synchronize. Go back to choose another category.`, `empty:${kind}`);
+			return undefined;
+		}
+		throw new Error(`The snapshot has no ${kind} to import`);
+	}
+	const catalog = importCatalog(choices.map((choice) => choice.path));
+	const picked = await selectPathsInteractively(context, profileName, catalog, {
+		title: `${direction === "push" ? "Upload" : "Import"} ${kind === "models" ? "models" : "plugins and configuration"} ${direction === "push" ? "to" : "from"} ${profileName}`,
+		actionLabel: "Review",
+		destinationLabel: direction === "push" ? `into remote profile ${profileName}` : "into the local config",
+	});
+	if (!picked?.length) return cancelled();
+	const expanded = selectArchivePaths(catalog, picked);
+	if (!context.selectProfile) throw new Error("Import review requires an interactive selector");
+	const replacements = new Map<string, Buffer>();
+	let paths: string[] = [];
+	let packageSettings: unknown;
+	const summary: string[] = [];
+	if (kind === "plugins") {
+		const local = await readDestination("settings.json");
+		const plan = mergePluginImport(archive, local, expanded);
+		if (plan.settings) replacements.set("settings.json", jsonBytes(plan.settings));
+		paths = plan.paths;
+		packageSettings = { packages: plan.packages };
+		summary.push(`plugins: ${plan.packageCount}`, `settings fields: ${plan.settingCount}`, `dependency files: ${plan.dependencyCount}`);
+	} else {
+		const selected = modelImportChoices(sourceModels).filter((choice) => expanded.includes(choice.path));
+		const localModels = await readDestination("models.json");
+		const localAuth = await readDestination("auth.json");
+		const sourceAuth = parseImportJson(archive.entries.get("files/auth.json"), "Snapshot auth.json");
+		const sourceConnections = new Set<string>();
+		for (const conflict of modelConnectionConflicts(sourceModels, localModels, sourceAuth, localAuth, selected)) {
+			const decision = await context.selectProfile([
+				{ id: "local", label: direction === "push" ? "Keep destination profile connection and credentials" : "Keep local provider connection and credentials" },
+				{ id: "source", label: direction === "push" ? "Use this machine's connection and credentials (affects all provider models)" : "Use source provider connection and credentials (affects all its models)" },
+			], `Provider ${importLabel(conflict.provider)}: different ${conflict.fields.map(importLabel).join(", ")}. Which connection should be used?`, `provider:${conflict.provider}`);
+			if (!decision || decision === "cancel") return cancelled();
+			if (decision !== "local" && decision !== "source") throw new Error("Unknown provider connection selection");
+			if (decision === "source") sourceConnections.add(conflict.provider);
+			summary.push(`connection ${importLabel(conflict.provider)}: ${decision === "source" ? "use source" : direction === "push" ? "keep destination" : "keep local"}`);
+		}
+		const plan = mergeModelImport(sourceModels, localModels, sourceAuth, localAuth, selected, sourceConnections);
+		replacements.set("models.json", jsonBytes(plan.models));
+		if (plan.auth) replacements.set("auth.json", jsonBytes(plan.auth));
+		summary.push(`models: ${plan.modelCount}`, `replaced: ${plan.replacedCount}`, `providers: ${plan.providers.map(importLabel).join(", ")}`);
+	}
+	const derived = createImportArchive(archive, paths, replacements, config);
+	return { archive: derived, paths: importArchivePaths(derived), packageSettings, summary };
+}
+
+async function reviewTransfer(
+	context: CommandContext,
+	plan: TransferPlan,
+	profileName: string,
+	kind: string,
+	direction: "push" | "pull",
+	exists: (file: string) => Promise<boolean>,
+	packageCount = 0,
+): Promise<boolean> {
+	if (!context.selectProfile) throw new Error("Transfer review requires an interactive selector");
+	const overwrites: string[] = [];
+	for (const file of plan.paths) if (await exists(file)) overwrites.push(file);
+	return (await context.selectProfile([
+		{ id: "apply", label: direction === "push" ? `✓ Upload selection to profile ${profileName}` : "✓ Import into the current local configuration" },
+	], [
+		`Review ${kind} ${direction === "push" ? "upload to" : "import from"} ${profileName}`,
+		...plan.summary,
+		`files: ${plan.paths.length}; overwrite: ${overwrites.length}; ${direction === "push" ? "local installs" : "missing packages"}: ${packageCount}`,
+		`Hash: ${shortHash(plan.archive.manifest.contentSha256)}`,
+		...plan.paths.slice(0, 20).map((file) => `  ${overwrites.includes(file) ? "replace" : "add"}: ${file}`),
+		...(plan.paths.length > 20 ? [`  … ${plan.paths.length - 20} more file(s)`] : []),
+		`Unselected content is preserved.${kind === "models" || kind === "plugins" ? " Current profile will stay unchanged." : ""}`,
+		"Import only trusted sources: plugins and credential commands can execute code.",
+	].join("\n"), "review")) === "apply";
+}
+
+/** Commit a reviewed download; targeted transfers do not adopt the source profile. */
+async function commandImport(
+	agentDir: string,
+	context: CommandContext,
+	config: WebdavSyncConfig,
+	profileName: string,
+	snapshotId: string,
+	archive: ParsedArchive,
+	kind: "models" | "plugins",
+	beforeApply: () => Promise<void>,
+): Promise<CommandResult> {
+	const cancelled = () => ok("pull: cancelled; nothing was imported", { cancelled: true });
+	const preconditions: LocalPreconditions = new Map();
+	const plan = await prepareTransfer(context, config, profileName, archive, kind,
+		async (file) => {
+			const value = await readImportFile(agentDir, file, preconditions);
+			context.setSyncScope?.({ destinationRevision: localRevision(preconditions) });
+			return value;
+		}, "pull");
+	if (!plan) return cancelled();
+	plan.localPreconditions = preconditions;
+	await captureLocalTargets(agentDir, plan.paths, preconditions);
+	context.setSyncScope?.({ destinationRevision: localRevision(preconditions) });
+	const packages = await packagesForImport(agentDir, plan.packageSettings);
+	if (!(await reviewTransfer(context, plan, profileName, kind, "pull",
+		async (file) => preconditions.get(file) !== null, packages.length))) return cancelled();
+	const shouldInstall = await shouldInstallPackages(packages, config,
+		context.confirmInstallPackages ? (specs) => context.confirmInstallPackages!(specs, "import") : undefined);
+	await verifyLocalTargets(agentDir, preconditions);
+	context.onSyncPhase?.("committing", "Applying selected configuration…");
+	await beforeApply();
+	const backup = await createLocalBackup(agentDir, config.backupRetention ?? 5, config);
+	await verifyLocalTargets(agentDir, preconditions);
+	const applied = await applyArchivePaths(agentDir, plan.archive, plan.paths, config, true);
+	const results = shouldInstall ? await installPackages(packages, context.installPackage, context.onInstallProgress) : [];
+	const lines = [
+		`pull: ${profileName}/${snapshotId}`, `mode: ${kind} import`, `source profile: ${profileName}`,
+		"current profile: unchanged", ...plan.summary, `files: ${applied.filesWritten}`,
+		`external: ${applied.externalFilesWritten}`, `backup: ${backup.id}`,
+	];
+	if (packages.length) lines.push(`packages: ${results.filter((result) => result.ok).length} installed, ${packages.length - results.filter((result) => result.ok).length} not installed`);
+	return ok(lines.join("\n"), { sourceProfile: profileName, snapshot: snapshotId, backup, applied, packages });
+}
+
+async function readLocalPlanFile(agentDir: string, file: string, expected: LocalPreconditions): Promise<Buffer | undefined> {
+	let bytes: Buffer | undefined;
+	try {
+		bytes = await fs.readFile(resolveConfiguredPath(file, agentDir));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Cannot read local ${importLabel(file)}`);
+	}
+	const hash = bytes ? sha256Bytes(bytes) : null;
+	if (expected.has(file) && expected.get(file) !== hash)
+		throw new Error(`Local ${importLabel(file)} changed during selection; restart synchronization to review the latest state`);
+	expected.set(file, hash);
+	return bytes;
+}
+
+async function readImportFile(agentDir: string, file: string, expected: LocalPreconditions): Promise<Record<string, unknown>> {
+	return parseImportJson(await readLocalPlanFile(agentDir, file, expected), `Local ${file}`);
+}
+
+async function captureLocalTargets(agentDir: string, paths: string[], expected: LocalPreconditions): Promise<void> {
+	for (const file of paths) if (!expected.has(file)) await readLocalPlanFile(agentDir, file, expected);
+}
+
+async function verifyLocalTargets(agentDir: string, expected: LocalPreconditions): Promise<void> {
+	for (const file of expected.keys()) await readLocalPlanFile(agentDir, file, expected);
+}
+
+function localRevision(expected: LocalPreconditions): string {
+	return sha256Bytes(Buffer.from(JSON.stringify([...expected].sort(([a], [b]) => a.localeCompare(b)))));
 }
 
 export async function pruneRemoteSnapshots(
@@ -1211,10 +1465,10 @@ async function resolveProfileTarget(
 	rootBackend: SyncBackend,
 	context: CommandContext,
 	parsed: ParsedArgs,
-	options: { allowCreate: boolean; requireExisting: boolean },
+	options: { allowCreate: boolean; requireExisting: boolean; deferCreate?: boolean },
 	agentDir: string,
 ): Promise<ProfileTarget | undefined> {
-	if (parsed.createProfile) return await claimNewProfile(rootBackend, parsed.createProfile);
+	if (parsed.createProfile) return await planNewProfile(rootBackend, parsed.createProfile, options.deferCreate);
 	if (parsed.profile) return await existingProfileTarget(rootBackend, parsed.profile);
 
 	// A remote whose only usable profile is not "default" must stay reachable
@@ -1222,6 +1476,8 @@ async function resolveProfileTarget(
 	let soleSelectable: string | undefined;
 	if (context.selectProfile) {
 		const profiles = await listRemoteProfiles(rootBackend);
+		const legacy = await legacyDefaultChoice(rootBackend);
+		if (legacy && !profiles.some((profile) => profile.id === legacy.id)) profiles.unshift(legacy);
 		const selectable = selectableProfiles(profiles);
 		if (selectable.length === 1) soleSelectable = selectable[0].id;
 		if (selectable.length > 1 || options.allowCreate) {
@@ -1235,7 +1491,7 @@ async function resolveProfileTarget(
 			const selected = choices.find((choice) => choice.id === selectedId);
 			if (!selected) throw new Error(`Unknown profile selection: ${selectedId}`);
 			if (selected.isCreate)
-				return await createProfileFromInput(rootBackend, context, profiles);
+				return await createProfileFromInput(rootBackend, context, profiles, options.deferCreate);
 			if (selected.unsupported)
 				throw new Error(`Profile name is not supported: ${selected.id}`);
 			return await existingProfileTarget(rootBackend, selected.id);
@@ -1341,6 +1597,7 @@ async function createProfileFromInput(
 	rootBackend: SyncBackend,
 	context: CommandContext,
 	knownProfiles: ProfileChoice[],
+	deferCreate = false,
 ): Promise<ProfileTarget | undefined> {
 	if (!context.inputProfileName)
 		throw new Error(
@@ -1350,7 +1607,25 @@ async function createProfileFromInput(
 		knownProfiles.map((profile) => profile.id),
 	);
 	if (input === undefined) return undefined;
-	return await claimNewProfile(rootBackend, normalizeProfileName(input));
+	return await planNewProfile(rootBackend, normalizeProfileName(input), deferCreate);
+}
+
+async function planNewProfile(rootBackend: SyncBackend, name: string, defer = false): Promise<ProfileTarget> {
+	if (!defer) return claimNewProfile(rootBackend, name);
+	if (await rootBackend.exists(profilePrefix(name)))
+		throw new Error(`Profile already exists: ${name} (delete it first with /webdav-sync:profiles delete ${name})`);
+	return { name, backend: scopedBackend(rootBackend, profilePrefix(name)), created: true };
+}
+
+async function readRemoteArchive(backend: SyncBackend, config: WebdavSyncConfig): Promise<{ archive: ParsedArchive; hash: string } | undefined> {
+	const hasIndex = await backend.exists("latest.json");
+	const hasZip = await backend.exists("latest.zip");
+	if (!hasIndex && !hasZip) return undefined;
+	if (!hasIndex || !hasZip) throw new Error("Destination profile has an incomplete latest snapshot; repair it before merging");
+	const latest = await backend.getJson<LatestIndex>("latest.json");
+	const archive = parseArchive(await backend.getBytes("latest.zip"), latest.zipSha256, config);
+	validateLatestMatchesManifest(latest, archive);
+	return { archive, hash: latest.zipSha256 };
 }
 
 /**
@@ -1483,6 +1758,11 @@ function validateLatestMatchesManifest(
 		);
 }
 
+/** Selected versions are compared with real installs, not declarations alone. */
+async function packagesForImport(agentDir: string, settings: unknown): Promise<string[]> {
+	return missingInstalledPackages(agentDir, settings, { includeUpdates: true });
+}
+
 async function settingsJsonFromArchive(
 	archive: ParsedArchive,
 ): Promise<unknown> {
@@ -1491,62 +1771,8 @@ async function settingsJsonFromArchive(
 	return JSON.parse(bytes.toString("utf8"));
 }
 
-/**
- * Package specs from a snapshot that this machine does not have yet. The machine's
- * own settings.json knows about every kind of install; npm specs are additionally
- * checked against Pi's npm roots, because a settings list can be stale.
- */
-async function missingPackagesOnThisMachine(
-	agentDir: string,
-	snapshotSettings: unknown,
-): Promise<string[]> {
-	const specs = extractPackageSpecs(snapshotSettings);
-	if (!specs.length) return [];
-	const listedSpecs = new Set(extractPackageSpecs(await localSettings(agentDir)));
-	const listedNames = new Set(
-		[...listedSpecs]
-			.map((spec) => npmPackageName(spec))
-			.filter((name): name is string => name !== undefined),
-	);
-	const missing: string[] = [];
-	for (const spec of specs) {
-		if (listedSpecs.has(spec)) continue;
-		const name = npmPackageName(spec);
-		if (!name) {
-			// A spec Pi installs elsewhere (git, local path, bare name) can only be
-			// judged by the settings list, which did not match.
-			missing.push(spec);
-			continue;
-		}
-		if (listedNames.has(name)) continue;
-		if (!(await npmPackageInstalled(agentDir, name))) missing.push(spec);
-	}
-	return missing;
-}
-
-/** Reads this machine's settings.json; an unreadable file means "nothing known". */
-async function localSettings(agentDir: string): Promise<unknown> {
-	try {
-		return JSON.parse(
-			await fs.readFile(path.join(agentDir, "settings.json"), "utf8"),
-		);
-	} catch {
-		return undefined;
-	}
-}
-
-/** Pi installs npm packages per scope: agent-wide, and project-local. */
-async function npmPackageInstalled(
-	agentDir: string,
-	name: string,
-): Promise<boolean> {
-	for (const root of [
-		path.join(agentDir, "npm", "node_modules"),
-		path.join(process.cwd(), ".pi", "npm", "node_modules"),
-	]) {
-		if (await fileExists(path.join(root, name))) return true;
-	}
-	return false;
+async function missingPackagesOnThisMachine(agentDir: string, settings: unknown): Promise<string[]> {
+	return missingInstalledPackages(agentDir, settings);
 }
 
 async function shouldInstallPackages(
@@ -1828,9 +2054,15 @@ function parseCommandArgs(command: string, args: string[]): ParsedArgs {
 			parsed.assumeYes = true;
 			continue;
 		}
+		if (arg === "--models" || arg === "--plugins") {
+			if (command !== "pull" && command !== "push") throw new Error(`${arg} is only valid for /webdav-sync:pull or /webdav-sync:push`);
+			if (arg === "--models") parsed.models = true;
+			else parsed.plugins = true;
+			continue;
+		}
 		if (arg === "--select") {
-			if (command !== "pull")
-				throw new Error("--select is only valid for /webdav-sync:pull");
+			if (command !== "pull" && command !== "push")
+				throw new Error("--select is only valid for /webdav-sync:pull or /webdav-sync:push");
 			parsed.select = true;
 			continue;
 		}
@@ -1839,6 +2071,8 @@ function parseCommandArgs(command: string, args: string[]): ParsedArgs {
 	}
 	if (parsed.profile && parsed.createProfile)
 		throw new Error("--profile and --create-profile cannot be combined");
+	if ([parsed.select, parsed.models, parsed.plugins].filter(Boolean).length > 1)
+		throw new Error("--select, --models and --plugins cannot be combined");
 	return parsed;
 }
 

@@ -69,6 +69,31 @@ export function npmPackageName(spec: string): string | undefined {
 	return match ? match[1] : undefined;
 }
 
+/** Package identity follows Pi: npm name, git repository without ref, or local source. */
+export function packageIdentity(spec: string): string {
+	const { body } = stripListPrefix(spec.trim());
+	const npmName = npmPackageName(body) ?? (isBareNpmPackageSpec(body) ? npmPackageName(`npm:${body}`) : undefined);
+	if (npmName) return `npm:${npmName.toLowerCase()}`;
+	if (/^(git:|https?:\/\/|ssh:\/\/)/i.test(body)) {
+		let source = body.startsWith("git:") && !body.startsWith("git://") ? body.slice(4) : body;
+		// Normalize scp-style SSH locations and the git:host/owner/repo shorthand.
+		if (!source.includes("://")) {
+			const scp = /^([^/@]+@)?([^/:]+):(.+)$/.exec(source);
+			source = scp ? `ssh://${scp[1] ?? ""}${scp[2]}/${scp[3]}` : `https://${source}`;
+		}
+		try {
+			const url = new URL(source);
+			// Refs follow the repo path, not the userinfo @ in the authority.
+			let repo = url.pathname.split("@")[0].replace(/\/+$/, "").replace(/\.git$/, "");
+			if (url.hostname.toLowerCase() === "github.com") repo = repo.toLowerCase();
+			return `git:${url.host.toLowerCase()}${repo}`;
+		} catch {
+			// Invalid specs retain their identity; installation validation handles them.
+		}
+	}
+	return body.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
 export function extractPackageSpecs(settings: unknown): string[] {
 	if (!settings || typeof settings !== "object") return [];
 	const packages = (settings as { packages?: unknown }).packages;

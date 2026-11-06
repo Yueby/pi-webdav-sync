@@ -1,8 +1,11 @@
 import { redactPackageSpec } from "./package-specs.js";
 import type { ProfileChoice } from "./profiles.js";
-import type { TreePickerTheme } from "./tree-picker.js";
+import { SYNC_BACK } from "./tree-picker.js";
+import type { SyncCustomUi } from "./persistent-sync.js";
 import {
 	runWebdavSyncCommand,
+	type CommandContext,
+	type CommandResult,
 	type InstallProgress,
 	type ProfileDeletePreview,
 	type ProfileMigratePreview,
@@ -13,6 +16,7 @@ import {
 
 type CommandUiContext = {
 	ui?: {
+		custom?: SyncCustomUi["custom"];
 		notify?: (message: string, level?: "info" | "error" | "warning") => unknown;
 		select?: (
 			message: string,
@@ -85,7 +89,7 @@ function register(
 			const setStatus = (text: string | undefined) =>
 				ctx?.ui?.setStatus?.(statusKey, text);
 			try {
-				const result = await runWebdavSyncCommand(input, {
+				const callbacks: CommandContext = {
 					confirmPush:
 						command === "push" && ctx?.ui?.confirm
 							? async (preview: PushPreview) =>
@@ -145,48 +149,13 @@ function register(
 										: "lowercase letters, digits, dot, dash, underscore",
 								)) ?? undefined
 						: undefined,
-					choosePaths:
-						ctx?.ui
-							? async (profileName: string, files: string[]) => {
-									// Space selects, Enter expands/enters, Esc cancels.
-									const { createTreePickerComponent } = await import(
-										"./tree-picker.js"
-									);
-									const ui = ctx.ui as unknown as {
-										custom?: <T>(
-											factory: (
-												tui: unknown,
-												theme: unknown,
-												keybindings: unknown,
-												done: (value: T) => void,
-											) => {
-												render(width: number): string[];
-												handleInput?(data: string): void;
-												invalidate(): void;
-											},
-										) => Promise<T | undefined>;
-									};
-									if (!ui.custom) return undefined;
-									return await ui.custom<string[] | undefined>(
-										(tui, theme, _keybindings, done) => {
-											const rows = (tui as { terminal?: { rows?: number } })
-												?.terminal?.rows;
-											return createTreePickerComponent(
-												profileName,
-												files,
-												done,
-												{
-													theme: theme as TreePickerTheme,
-													height:
-														typeof rows === "number" && rows > 0
-															? rows
-															: undefined,
-												},
-											);
-										},
-									);
-								}
-							: undefined,
+					selectStep: ctx?.ui?.select
+						? async (choices: ProfileChoice[], message: string) => {
+								const labels = choices.map((choice) => choice.label);
+								const selected = await ctx.ui!.select!(message, labels);
+								return selected === undefined ? SYNC_BACK : choices.find((choice) => choice.label === selected)?.id;
+							}
+						: undefined,
 					selectSnapshot: ctx?.ui?.select
 						? async (choices: SnapshotChoice[]) => {
 								const labels = choices.map((choice) => choice.label);
@@ -198,15 +167,29 @@ function register(
 							}
 						: undefined,
 					confirmInstallPackages: ctx?.ui?.confirm
-						? async (specs: string[]) =>
-								ctx.ui?.confirm?.(
-									"Install Pi packages this machine is missing?",
-									formatInstallPrompt(specs),
-								) ?? false
+						? async (specs: string[], mode?: "import") =>
+								mode === "import"
+									? ctx.ui?.confirm?.(
+											"Install selected plugin packages?",
+											"Selected plugin packages to install or update:\n" +
+												specs.map(redactPackageSpec).join("\n"),
+										) ?? false
+									: ctx.ui?.confirm?.(
+											"Install Pi packages this machine is missing?",
+											formatInstallPrompt(specs),
+										) ?? false
 						: undefined,
 					onInstallProgress: (progress) =>
 						setStatus(formatInstallProgress(progress)),
-				});
+				};
+				let result: CommandResult;
+				if ((command === "push" || command === "pull") && ctx?.ui?.custom) {
+					const { runPersistentSync } = await import("./persistent-sync.js");
+					result = await runPersistentSync({ custom: ctx.ui.custom.bind(ctx.ui) }, command, callbacks,
+						(context) => runWebdavSyncCommand(input, context));
+				} else {
+					result = await runWebdavSyncCommand(input, callbacks);
+				}
 				ctx?.ui?.notify?.(result.text, result.ok ? "info" : "error");
 				return result.text;
 			} finally {
