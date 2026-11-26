@@ -6,6 +6,7 @@
  * and safe multiline title truncation.
  */
 
+import { normalizeKey } from "./keys.js";
 import {
 	computeViewport,
 	ROW_RESET,
@@ -180,7 +181,9 @@ export function createSyncMenuComponent(
 
 			return lines.slice(0, totalHeight);
 		},
-		handleInput(data: string) {
+		handleInput(rawData: string) {
+			const data = normalizeKey(rawData);
+			if (!data) return;
 			if (data === "\x1b[5~" || data === "pageup" || data === "pgup") {
 				titleOffset = Math.max(0, titleOffset - 5);
 				return;

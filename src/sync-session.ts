@@ -1,3 +1,4 @@
+import { normalizeKey } from "./keys.js";
 import {
 	createSyncMenuComponent,
 	type SyncMenuOptions,
@@ -390,7 +391,9 @@ export function createSyncSession(options: SyncSessionOptions): SyncSession {
 			}
 			return renderLoading(width);
 		},
-		handleInput(data: string): void {
+		handleInput(rawData: string): void {
+			const data = normalizeKey(rawData);
+			if (!data) return;
 			if (disposed) return;
 			if (committing) {
 				// Once committing, ignore navigation and user input

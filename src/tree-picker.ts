@@ -8,6 +8,8 @@
  * can be tested without a terminal.
  */
 
+import { normalizeKey } from "./keys.js";
+
 export const SYNC_BACK = "__sync_back__";
 export const SYNC_CANCEL = "__sync_cancel__";
 
@@ -258,7 +260,8 @@ export function reduceTreePicker(
 }
 
 /** Raw key sequences, so the component needs no TUI imports to handle input. */
-export function pickerActionFor(data: string): TreePickerAction | undefined {
+export function pickerActionFor(rawData: string): TreePickerAction | undefined {
+	const data = normalizeKey(rawData);
 	if (data === " " || data === "space") return "space";
 	if (data === "\r" || data === "\n" || data === "enter" || data === "return")
 		return "enter";
