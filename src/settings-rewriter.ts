@@ -1,4 +1,6 @@
+import { statSync } from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import {
 	externalResourceZipRoot,
@@ -159,19 +161,36 @@ function rewriteLocalReference(value: string, ctx: RewriteContext): string {
 		return value;
 	}
 
-	const id = stableResourceId(resolved);
-	const baseName = path.basename(resolved) || "resource";
+	// An entry file's siblings (./src/..., ./lib/...) are part of the extension,
+	// so an external index.* is collected together with its directory.
+	const root = entryDirectory(resolved);
+	const id = stableResourceId(root);
+	const baseName = path.basename(root) || "resource";
 	const zipRoot = externalResourceZipRoot(id, baseName);
-	const settingsPath = `./${zipRoot}`;
+	const settingsPath = root === resolved
+		? `./${zipRoot}`
+		: `./${zipRoot}/${path.basename(resolved)}`;
 	if (!ctx.externalReferences.has(id)) {
 		ctx.externalReferences.set(id, {
 			id,
-			sourcePath: resolved,
+			sourcePath: root,
 			zipRoot,
 			settingsPath,
 		});
 	}
 	return withListPrefix(prefix, settingsPath);
+}
+
+/** The directory of a conventional `index.*` entry file; anything else is itself. */
+function entryDirectory(resolved: string): string {
+	if (!/^index\.(?:[cm]?[jt]s)$/i.test(path.basename(resolved))) return resolved;
+	const parent = path.dirname(resolved);
+	if (parent === path.parse(parent).root || path.resolve(parent) === path.resolve(os.homedir())) return resolved;
+	try {
+		return statSync(resolved).isFile() ? parent : resolved;
+	} catch {
+		return resolved;
+	}
 }
 
 function isExternalResourceRelativePath(relativePath: string): boolean {
