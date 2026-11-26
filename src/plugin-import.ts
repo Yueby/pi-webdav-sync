@@ -59,7 +59,8 @@ export function mergePluginImport(
 	archive: ParsedArchive,
 	localSettings: JsonObject,
 	pickedPaths: string[],
-): { settings?: JsonObject; paths: string[]; packages: unknown[]; packageCount: number; settingCount: number; dependencyCount: number } {
+	removeUnlisted = false,
+): { settings?: JsonObject; paths: string[]; packages: unknown[]; removedPackages: string[]; packageCount: number; settingCount: number; dependencyCount: number } {
 	assertSafeJson(localSettings);
 	const incoming = parseImportJson(archive.entries.get("files/settings.json"), "Snapshot settings.json");
 	const catalog = new Map(pluginImportChoices(archive).map((choice) => [choice.path, choice]));
@@ -73,7 +74,12 @@ export function mergePluginImport(
 	const keys = choices.filter((choice) => choice.kind === "setting").map((choice) => choice.key!);
 	const paths = new Set(choices.filter((choice) => choice.kind === "file").map((choice) => choice.file!));
 	const settings: JsonObject = { ...localSettings };
-	if (packages.length) settings.packages = mergeEntries(packageEntries(localSettings), packages);
+	const removed = removeUnlisted ? destinationOnlyPackages(archive, localSettings) : [];
+	if (packages.length || removed.length) {
+		const gone = new Set(removed.map(entryIdentity));
+		settings.packages = mergeEntries(packageEntries(localSettings), packages)
+			.filter((entry) => !gone.has(entryIdentity(entry)));
+	}
 	for (const key of keys) {
 		if (RESOURCE_KEYS.has(key)) {
 			if (!Array.isArray(incoming[key]) || (settings[key] !== undefined && !Array.isArray(settings[key])))
@@ -105,13 +111,21 @@ export function mergePluginImport(
 		}
 	}
 	return {
-		settings: packages.length || keys.length ? settings : undefined,
+		settings: packages.length || keys.length || removed.length ? settings : undefined,
 		paths: [...paths].sort(),
 		packages,
+		removedPackages: removed.map((entry) => packageSource(entry)),
 		packageCount: packages.length,
 		settingCount: keys.length,
 		dependencyCount: paths.size - explicitCount,
 	};
+}
+
+/** Destination package declarations that the source snapshot does not list at all. */
+export function destinationOnlyPackages(archive: ParsedArchive, destinationSettings: JsonObject): unknown[] {
+	const source = parseImportJson(archive.entries.get("files/settings.json"), "Snapshot settings.json");
+	const known = new Set(packageEntries(source).map(entryIdentity));
+	return packageEntries(destinationSettings).filter((entry) => !known.has(entryIdentity(entry)));
 }
 
 /** A whole settings.json carries its local resource references in either direction. */
@@ -130,7 +144,7 @@ function packageEntries(settings: JsonObject): unknown[] {
 	return settings.packages;
 }
 
-function packageSource(entry: unknown): string {
+export function packageSource(entry: unknown): string {
 	const value = typeof entry === "string" ? entry : isJsonObject(entry) ? entry.source : undefined;
 	if (typeof value !== "string" || !value.trim()) throw new Error("A package entry must have a nonempty source");
 	return value;

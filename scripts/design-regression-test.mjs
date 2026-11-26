@@ -42,7 +42,8 @@ export async function runDesignRegressionTests({ MemoryBackend }) {
 		await init(race, { packages: ["npm:existing"], untouched: "before" });
 		const raced = await runWebdavSyncCommand(["pull", "--plugins", "--profile", "a", "latest"], {
 			agentDir: race, backend, choosePaths: async () => ["Packages"],
-			selectProfile: async () => {
+			selectProfile: async (_choices, message) => {
+				if (message.includes("does not list")) return "keep";
 				await fs.writeFile(path.join(race, "settings.json"), jsonBytes({ packages: ["npm:existing", "npm:concurrent"], untouched: "concurrent edit" }));
 				return "apply";
 			},
@@ -171,7 +172,7 @@ export async function runDesignRegressionTests({ MemoryBackend }) {
 		let installPrompts = 0;
 		for (let attempt = 0; attempt < 2; attempt++) {
 			const imported = await runWebdavSyncCommand(["pull", "--plugins", "--profile", "a", "latest"], {
-				agentDir: skipped, backend, choosePaths: async () => ["Packages"], selectProfile: async () => "apply",
+				agentDir: skipped, backend, choosePaths: async () => ["Packages"], selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 				confirmInstallPackages: async (specs) => { installPrompts++; assert.deepEqual(specs, ["npm:design-test-pkg"]); return false; },
 				installPackage: async () => { throw new Error("Declined installation must not execute"); },
 			});

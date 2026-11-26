@@ -57,13 +57,14 @@ export async function runImportSelfTests({ MemoryBackend }) {
 		let installed = [];
 		let presentation;
 		let review;
+		let removalPrompt;
 		const pluginResult = await runWebdavSyncCommand(["pull", "--plugins", "--profile", "source", "latest"], {
 			agentDir: target, backend,
 			choosePaths: async (_profile, files, options) => {
 				presentation = options;
 				return files.filter((file) => file.startsWith("Packages/") && !file.includes("unselected") || file === "Settings (manual)/foo" || file === "Supplemental files (manual)/plugin-config.json");
 			},
-			selectProfile: async (_choices, message) => { review = message; return "apply"; },
+			selectProfile: async (_choices, message) => { if (message.includes("does not list")) { removalPrompt = message; return "keep"; } review = message; return "apply"; },
 			confirmInstallPackages: async (specs, mode) => { assert.equal(mode, "import"); assert.deepEqual(specs, ["npm:foo@2", "npm:new-pkg"]); return true; },
 			installPackage: async (spec) => { installed.push(spec); return 0; },
 		});
@@ -79,6 +80,7 @@ export async function runImportSelfTests({ MemoryBackend }) {
 		assert.equal(merged.defaultModel, "local-model");
 		assert.equal(merged.shellPath, "/local/shell");
 		assert.equal(merged.packages.filter((entry) => typeof entry === "string" && entry.startsWith("npm:foo")).length, 1);
+		assert.match(removalPrompt, /This machine has 1 package\(s\)[^]*npm:keep/);
 		assert(merged.packages.includes("npm:keep"));
 		assert(!merged.packages.includes("foo@1"));
 		assert(!merged.packages.includes("npm:unselected"));
@@ -90,6 +92,20 @@ export async function runImportSelfTests({ MemoryBackend }) {
 		assert.equal(await fs.readFile(path.join(target, "AGENTS.md"), "utf8"), "local rules\n");
 		assert.deepEqual(await json(path.join(target, "plugin-config.json")), { enabled: true });
 		assert.equal((await json(path.join(target, ".webdav-sync", "state.json"))).currentProfile, "mine");
+
+		// Choosing "remove" drops destination-only packages and reports it in the review.
+		const mirror = path.join(root, "mirror");
+		await init(mirror, { packages: ["npm:keep", "npm:other-stale"] });
+		let mirrorReview;
+		const mirrorResult = await runWebdavSyncCommand(["pull", "--plugins", "--profile", "source", "latest"], {
+			agentDir: mirror, backend, choosePaths: async (_profile, files) => files.filter((file) => file.startsWith("Packages/") && !file.includes("unselected")),
+			selectProfile: async (_choices, message) => { if (message.includes("does not list")) return "remove"; mirrorReview = message; return "apply"; },
+			confirmInstallPackages: async () => false,
+		});
+		assert.equal(mirrorResult.ok, true, mirrorResult.text);
+		assert.match(mirrorReview, /packages removed: 2/);
+		const mirrored = await json(path.join(mirror, "settings.json"));
+		assert(!mirrored.packages.includes("npm:keep") && !mirrored.packages.includes("npm:other-stale"));
 
 		// Cancel the review, not just the picker: no backups or writes may occur.
 		const cancelled = path.join(root, "cancelled");
@@ -168,7 +184,7 @@ export async function runImportSelfTests({ MemoryBackend }) {
 		const fileOnly = await runWebdavSyncCommand(["pull", "--plugins", "--profile", "source", "latest"], {
 			agentDir: target, backend,
 			choosePaths: async () => ["Supplemental files (manual)/extensions/free"],
-			selectProfile: async () => "apply",
+			selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 			confirmInstallPackages: async () => { throw new Error("File-only import must not offer packages"); },
 		});
 		assert.equal(fileOnly.ok, true, fileOnly.text);
@@ -195,7 +211,7 @@ export async function runImportSelfTests({ MemoryBackend }) {
 		// Bad JSON is never treated as an empty config in an import.
 		await fs.writeFile(path.join(cancelled, "settings.json"), "{bad json");
 		const badResult = await runWebdavSyncCommand(["pull", "--plugins", "--profile", "source", "latest"], {
-			agentDir: cancelled, backend, choosePaths: async () => ["Packages"], selectProfile: async () => "apply",
+			agentDir: cancelled, backend, choosePaths: async () => ["Packages"], selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 		});
 		assert.equal(badResult.ok, false);
 		assert.match(badResult.text, /Local settings.json must contain valid JSON/);
@@ -219,6 +235,15 @@ export async function runImportSelfTests({ MemoryBackend }) {
 		}, ruleChoices.filter((choice) => choice.kind !== "file").map((choice) => choice.path));
 		assert.deepEqual(rulePlan.settings.packages, [{ source: "git:github.com/example/plugin@v2", extensions: ["chosen.ts"] }]);
 		assert.deepEqual(rulePlan.settings.extensions, ["-builtin:mcp", "!extensions/**/*.ts"]);
+		assert.equal(rulePlan.removedPackages.length, 0);
+		// Packages absent from the source are kept by default and dropped on request.
+		const staleLocal = { packages: ["npm:old-plugin", { source: "git:github.com/example/plugin@v1" }], theme: "x" };
+		const keepPlan = mergePluginImport(rulesAndGit, staleLocal, ruleChoices.filter((choice) => choice.kind === "package").map((choice) => choice.path));
+		assert.equal(keepPlan.settings.packages.length, 2);
+		const dropPlan = mergePluginImport(rulesAndGit, staleLocal, ruleChoices.filter((choice) => choice.kind === "package").map((choice) => choice.path), true);
+		assert.deepEqual(dropPlan.settings.packages, [{ source: "git:github.com/example/plugin@v2", extensions: ["chosen.ts"] }]);
+		assert.deepEqual(dropPlan.removedPackages, ["npm:old-plugin"]);
+		assert.equal(dropPlan.settings.theme, "x");
 		assert.equal(rulePlan.dependencyCount, 0);
 		assert.equal(packageIdentity("git:git@github.com:example/plugin.git@feature/next"), packageIdentity("https://github.com/example/plugin@v2"));
 		assert.equal(packageIdentity("git:github.com/example/plugin#v1"), packageIdentity("git:github.com/example/plugin#v2"));
@@ -252,7 +277,7 @@ export async function runImportSelfTests({ MemoryBackend }) {
 		await init(unauthorized, { packages: [] });
 		await fs.writeFile(path.join(unauthorized, "settings.webdav.json"), jsonBytes({ ...config, extraFiles: [] }));
 		const rejected = await runWebdavSyncCommand(["pull", "--plugins", "--profile", "source", "latest"], {
-			agentDir: unauthorized, backend, choosePaths: async () => ["Supplemental files (manual)/plugin-config.json"], selectProfile: async () => "apply",
+			agentDir: unauthorized, backend, choosePaths: async () => ["Supplemental files (manual)/plugin-config.json"], selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 		});
 		assert.equal(rejected.ok, false);
 		assert.match(rejected.text, /not allowlisted/);
@@ -267,7 +292,7 @@ export async function runImportSelfTests({ MemoryBackend }) {
 		await init(latestTarget, { packages: ["npm:foo@1"] });
 		const updates = [];
 		const latestResult = await runWebdavSyncCommand(["pull", "--plugins", "latest"], {
-			agentDir: latestTarget, backend: latestBackend, choosePaths: async () => ["Packages"], selectProfile: async () => "apply",
+			agentDir: latestTarget, backend: latestBackend, choosePaths: async () => ["Packages"], selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 			confirmInstallPackages: async (specs) => { assert.deepEqual(specs, ["npm:foo@latest"]); return true; },
 			installPackage: async (spec) => { updates.push(spec); return 0; },
 		});

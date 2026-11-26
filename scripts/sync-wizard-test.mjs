@@ -78,7 +78,7 @@ export async function runSyncWizardTests({ MemoryBackend }) {
 		const pushedPlugins = await runWebdavSyncCommand(["push", "--plugins", "--profile", "remote"], {
 			agentDir: local, backend,
 			choosePaths: async (_profile, files) => files.filter((file) => file.startsWith("Packages/") || file === "Settings (manual)/pluginConfig"),
-			selectProfile: async () => "apply",
+			selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 			installPackage: async () => { throw new Error("Push must not install packages"); },
 		});
 		assert.equal(pushedPlugins.ok, true, pushedPlugins.text);
@@ -93,7 +93,7 @@ export async function runSyncWizardTests({ MemoryBackend }) {
 		assert.equal((await json(path.join(local, ".webdav-sync", "state.json"))).currentProfile, "mine");
 
 		const pushedFile = await runWebdavSyncCommand(["push", "--select", "--profile", "remote"], {
-			agentDir: local, backend, choosePaths: async () => ["extensions/local.js"], selectProfile: async () => "apply",
+			agentDir: local, backend, choosePaths: async () => ["extensions/local.js"], selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 		});
 		assert.equal(pushedFile.ok, true, pushedFile.text);
 		remote = remoteArchive();
@@ -196,13 +196,14 @@ export async function runSyncWizardTests({ MemoryBackend }) {
 		const escTarget = path.join(root, "esc-close");
 		await seed(escTarget, "esc-target");
 		const escBefore = await fs.readFile(path.join(escTarget, "settings.json"), "utf8");
-		let escCategories = 0, escTrees = 0, escReviews = 0;
+		let escCategories = 0, escTrees = 0, escReviews = 0, escRemovals = 0;
 		let escSelection;
 		const escClosed = await runWebdavSyncCommand(["pull", "--profile", "remote", "latest"], {
 			agentDir: escTarget, backend,
 			selectStep: async (choices, message) => {
 				assert(choices.every((choice) => !["cancel", SYNC_BACK, SYNC_CANCEL].includes(choice.id)));
 				if (message.includes("what should be applied")) return ++escCategories === 1 ? "plugins" : SYNC_BACK;
+				if (message.includes("does not list")) return ++escRemovals === 1 ? "keep" : SYNC_BACK;
 				if (message.startsWith("Review ")) { escReviews++; return SYNC_BACK; }
 				throw new Error(`Unexpected Esc-close menu: ${message}`);
 			},
@@ -245,7 +246,7 @@ export async function runSyncWizardTests({ MemoryBackend }) {
 		// A selected upload to a fresh profile publishes a complete, valid snapshot,
 		// without copying unrelated local files or adopting that profile.
 		const fresh = await runWebdavSyncCommand(["push", "--create-profile", "fresh", "--plugins"], {
-			agentDir: local, backend, choosePaths: async () => ["Packages"], selectProfile: async () => "apply",
+			agentDir: local, backend, choosePaths: async () => ["Packages"], selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 		});
 		assert.equal(fresh.ok, true, fresh.text);
 		const freshIndex = JSON.parse(backend.files.get("profiles/fresh/latest.json"));
@@ -286,7 +287,7 @@ export async function runSyncWizardTests({ MemoryBackend }) {
 		await backend.putBytes("profiles/raw/latest.zip", rawZip.zipBytes);
 		await backend.putJson("profiles/raw/latest.json", rawZip.latest);
 		const rawResult = await runWebdavSyncCommand(["push", "--models", "--profile", "raw"], {
-			agentDir: local, backend, choosePaths: async () => ["Models"], selectProfile: async () => "apply",
+			agentDir: local, backend, choosePaths: async () => ["Models"], selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 		});
 		assert.equal(rawResult.ok, false);
 		assert.match(rawResult.text, /raw backup profile/);
@@ -312,7 +313,7 @@ export async function runSyncWizardTests({ MemoryBackend }) {
 		const receiver = path.join(root, "external-receiver");
 		await seed(receiver, "receiver");
 		const externalPull = await runWebdavSyncCommand(["pull", "--profile", "external-profile", "--select", "latest"], {
-			agentDir: receiver, backend, choosePaths: async () => ["settings.json"], selectProfile: async () => "apply",
+			agentDir: receiver, backend, choosePaths: async () => ["settings.json"], selectProfile: async (_choices, message) => message?.includes("does not list") ? "keep" : "apply",
 		});
 		assert.equal(externalPull.ok, true, externalPull.text);
 		const skillReference = (await json(path.join(receiver, "settings.json"))).skills[0];
@@ -339,6 +340,7 @@ export async function runSyncWizardTests({ MemoryBackend }) {
 		const installCancelled = await runWebdavSyncCommand(["pull", "--profile", "remote", "--plugins", "latest"], {
 			agentDir: installCancelledTarget, backend, choosePaths: async () => ["Packages"],
 			selectStep: async (_choices, message) => {
+				if (message.includes("does not list")) return "keep";
 				if (message.startsWith("Review ")) return "apply";
 				if (message.startsWith("Install or update")) { sawInstallPrompt = true; return SYNC_CANCEL; }
 				throw new Error(`Unexpected package menu: ${message}`);

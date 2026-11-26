@@ -26,10 +26,10 @@ import {
 } from "./config.js";
 import { createLatestIndex, type LatestIndex, shortHash, sha256Bytes } from "./manifest.js";
 import { getAgentDir, pathInside, resolveConfiguredPath } from "./paths.js";
-import { isInstallableSpec } from "./package-specs.js";
+import { isInstallableSpec, redactPackageSpec } from "./package-specs.js";
 import { missingInstalledPackages } from "./package-state.js";
 import { createImportArchive, mergeRemoteArchive, importArchivePaths, importCatalog, importLabel, jsonBytes, parseImportJson } from "./import-plan.js";
-import { pluginImportChoices, mergePluginImport, includeSettingsDependencies } from "./plugin-import.js";
+import { pluginImportChoices, mergePluginImport, destinationOnlyPackages, packageSource, includeSettingsDependencies } from "./plugin-import.js";
 import { modelImportChoices, modelConnectionConflicts, mergeModelImport } from "./model-import.js";
 import type { PickerPresentation, PickerSelection } from "./tree-picker.js";
 import { runSyncNavigation, isNavigationSignal } from "./sync-navigation.js";
@@ -639,11 +639,31 @@ async function prepareTransfer(
 	const summary: string[] = [];
 	if (kind === "plugins") {
 		const local = await readDestination("settings.json");
-		const plan = mergePluginImport(archive, local, expanded);
+		// Packages the destination has but the source lacks entirely: ask once whether
+		// to follow the source, so uninstalled plugins do not come back on the next sync.
+		let removeUnlisted = false;
+		const picksPackages = choices.some((choice) => (choice as { kind?: string }).kind === "package" && expanded.includes(choice.path));
+		const extra = picksPackages ? destinationOnlyPackages(archive, local).map(packageSource) : [];
+		if (extra.length) {
+			const where = direction === "push" ? `remote profile ${profileName}` : "this machine";
+			const decision = await context.selectProfile([
+				{ id: "keep", label: `Keep ${extra.length} extra package(s) on ${where}` },
+				{ id: "remove", label: `Remove ${extra.length} package(s) to match the ${direction === "push" ? "local" : "source"} list` },
+			], [
+				`${where[0].toUpperCase()}${where.slice(1)} has ${extra.length} package(s) the ${direction === "push" ? "local config" : "source"} does not list:`,
+				...extra.slice(0, 10).map((spec) => `  ${importLabel(redactPackageSpec(spec))}`),
+				...(extra.length > 10 ? [`  … ${extra.length - 10} more`] : []),
+				"Remove them so every machine keeps the same packages?",
+			].join("\n"), "remove-packages");
+			if (!decision || decision === "cancel") return cancelled();
+			if (decision !== "keep" && decision !== "remove") throw new Error("Unknown package removal selection");
+			removeUnlisted = decision === "remove";
+		}
+		const plan = mergePluginImport(archive, local, expanded, removeUnlisted);
 		if (plan.settings) replacements.set("settings.json", jsonBytes(plan.settings));
 		paths = plan.paths;
 		packageSettings = { packages: plan.packages };
-		summary.push(`plugins: ${plan.packageCount}`, `settings fields: ${plan.settingCount}`, `dependency files: ${plan.dependencyCount}`);
+		summary.push(`plugins: ${plan.packageCount}`, ...(plan.removedPackages.length ? [`packages removed: ${plan.removedPackages.length}`] : []), `settings fields: ${plan.settingCount}`, `dependency files: ${plan.dependencyCount}`);
 	} else {
 		const selected = modelImportChoices(sourceModels).filter((choice) => expanded.includes(choice.path));
 		const localModels = await readDestination("models.json");
